@@ -70,6 +70,11 @@ app.disable('x-powered-by');
 // Trust proxy — el reverse proxy termina TLS y reenvía con X-Forwarded-*.
 app.set('trust proxy', true);
 
+// Middleware de parsing — antes de los route handlers para que /connect-ml/finish
+// y /refresh-token reciban req.body parseado.
+app.use(express.urlencoded({ extended: false, limit: '64kb' }));
+app.use(express.json({ limit: '64kb' }));
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -120,6 +125,156 @@ function htmlPage(title, body) {
 </head><body>
 <div class="wrap">${body}</div>
 <p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:30px;">wooforger-connect-ml · stateless OAuth bridge</p>
+</body></html>`;
+}
+
+/**
+ * Pantalla de confirmación pre-handoff: el usuario revisa los datos de la cuenta
+ * y decide si confirmar (mandar al plugin) o cancelar (volver sin guardar).
+ *
+ * Stateless: payload + return_to + nonce viajan como hidden fields firmados con
+ * HMAC. El handler /connect-ml/finish valida la firma y decide qué hacer.
+ */
+function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
+    const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+    // Firma sobre el trío payload|return_to|nonce para evitar tampering del form.
+    const formSig = crypto.createHmac('sha256', HUB_SECRET)
+        .update(payloadB64 + '|' + returnTo + '|' + nonce)
+        .digest('base64');
+
+    const hasRefresh = !!payload.refresh_token;
+    const siteIdOk = payload.site_id && payload.site_id !== '0';
+    const expHours = payload.expires_in > 0 ? (payload.expires_in / 3600).toFixed(1) : '?';
+
+    const warnings = [];
+    if (!hasRefresh) {
+        warnings.push('El payload <strong>no incluye refresh_token</strong>. Tu sitio no podrá renovar el token automáticamente cuando expire (~6h) y vas a tener que reconectar manualmente.');
+    }
+    if (!siteIdOk) {
+        warnings.push('El <strong>site_id</strong> vino vacío. Esto puede impedir que el plugin identifique correctamente el país de tu cuenta.');
+    }
+
+    const warningsHtml = warnings.length === 0 ? '' : `
+        <div class="warnings">
+            <strong>⚠ Atención antes de confirmar:</strong>
+            <ul>${warnings.map(w => `<li>${w}</li>`).join('')}</ul>
+        </div>
+    `;
+
+    return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<title>Confirmá tu cuenta · WooForger</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(180deg,#f5f7fa 0%,#eef2f7 100%); color: #1f2937; padding: 20px; line-height: 1.55; min-height: 100vh; margin: 0; }
+  .wrap { max-width: 680px; margin: 40px auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.06); overflow: hidden; }
+  /* === Hero trío === */
+  .hero { background: radial-gradient(circle at 25% 50%, rgba(33,117,191,0.06), transparent 45%), radial-gradient(circle at 75% 50%, rgba(255,230,0,0.10), transparent 45%), linear-gradient(180deg,#fafbfc 0%,#f3f4f6 100%); padding: 32px 24px 28px; border-bottom: 1px solid #e5e7eb; }
+  .trio { display: grid; grid-template-columns: 1fr 80px 1.3fr 80px 1fr; align-items: center; justify-items: center; gap: 0; max-width: 560px; margin: 0 auto; }
+  .side, .center { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; position: relative; }
+  .ring { background: #fff; border-radius: 50%; width: 56px; height: 56px; display: inline-flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.04); border: 1px solid rgba(0,0,0,0.04); position: relative; z-index: 1; }
+  .ring img { max-width: 36px; max-height: 36px; object-fit: contain; }
+  .ring.is-center { width: 76px; height: 76px; box-shadow: 0 8px 24px rgba(229,91,15,0.18), 0 2px 6px rgba(0,0,0,0.08); }
+  .ring.is-center img { max-width: 52px; max-height: 52px; }
+  .halo { position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 76px; height: 76px; border-radius: 50%; background: radial-gradient(circle, rgba(229,91,15,0.25) 0%, transparent 70%); animation: pulse 2.6s ease-in-out infinite; pointer-events: none; z-index: 0; }
+  @keyframes pulse { 0%,100% { transform: translateX(-50%) scale(1); opacity: 0.7; } 50% { transform: translateX(-50%) scale(1.15); opacity: 0.3; } }
+  .label { font-size: 11px; color: #4b5563; line-height: 1.3; font-weight: 500; }
+  .label.is-center { font-size: 12px; }
+  .label.is-center strong { color: #E55B0F; font-weight: 700; font-size: 13px; }
+  .label.is-center span { color: #6b7280; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .connector { position: relative; width: 100%; height: 18px; display: flex; align-items: center; }
+  .line { width: 100%; height: 2px; background: linear-gradient(90deg,transparent 0%,#cbd5e1 15%,#cbd5e1 85%,transparent 100%); border-radius: 999px; }
+  .dot { position: absolute; top: 50%; left: 0; width: 6px; height: 6px; border-radius: 50%; background: #E55B0F; transform: translateY(-50%); box-shadow: 0 0 8px rgba(229,91,15,0.6); animation: flow 2.4s linear infinite; }
+  .dot.d2 { animation-delay: 0.8s; } .dot.d3 { animation-delay: 1.6s; }
+  @keyframes flow { 0% { left: -6px; opacity: 0; transform: translateY(-50%) scale(0.5); } 10% { opacity: 1; transform: translateY(-50%) scale(1); } 90% { opacity: 1; transform: translateY(-50%) scale(1); } 100% { left: calc(100% + 6px); opacity: 0; transform: translateY(-50%) scale(0.5); } }
+  /* === Body === */
+  .body { padding: 26px 32px 28px; }
+  h1 { margin: 0 0 6px; font-size: 20px; color: #111827; }
+  .intro { color: #4b5563; font-size: 13.5px; margin: 0 0 18px; }
+  .site-pill { display: inline-block; background: #eef2ff; color: #3730a3; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; margin-left: 4px; }
+  .details { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 4px 0; margin-bottom: 16px; }
+  .row { display: flex; padding: 10px 16px; border-bottom: 1px solid #f3f4f6; }
+  .row:last-child { border-bottom: 0; }
+  .row .k { width: 130px; color: #6b7280; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; flex-shrink: 0; }
+  .row .v { flex: 1; font-size: 13px; color: #111827; }
+  .row .v code { background: #f3f4f6; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+  .row .v.big { font-weight: 700; font-size: 15px; }
+  .ok { color: #047857; }
+  .err { color: #b91c1c; }
+  .warnings { background: #fef3c7; border: 1px solid #fde68a; border-radius: 10px; padding: 12px 16px; margin-bottom: 18px; color: #78350f; font-size: 12.5px; }
+  .warnings strong { display: block; margin-bottom: 6px; }
+  .warnings ul { margin: 0; padding-left: 18px; }
+  .warnings li { margin: 4px 0; line-height: 1.45; }
+  .actions { display: flex; gap: 12px; justify-content: flex-end; }
+  .btn { padding: 10px 18px; border-radius: 8px; border: 1px solid; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+  .btn-primary { background: #E55B0F; border-color: #E55B0F; color: #fff; }
+  .btn-primary:hover { background: #c44a08; border-color: #c44a08; }
+  .btn-secondary { background: #fff; border-color: #d1d5db; color: #374151; }
+  .btn-secondary:hover { background: #f9fafb; border-color: #9ca3af; }
+  .hint { margin: 18px 0 0; font-size: 11.5px; color: #9ca3af; text-align: center; line-height: 1.5; }
+  @media (max-width: 560px) {
+      .trio { grid-template-columns: 1fr 30px 1.3fr 30px 1fr; }
+      .row { flex-direction: column; gap: 4px; }
+      .row .k { width: auto; }
+      .actions { flex-direction: column-reverse; }
+      .btn { width: 100%; }
+  }
+</style>
+</head><body>
+<div class="wrap">
+    <div class="hero">
+        <div class="trio">
+            <div class="side">
+                <div class="ring"><img src="https://s.w.org/style/images/about/WordPress-logotype-wmark.png" alt="WordPress" /></div>
+                <span class="label">Tu tienda<br>WooCommerce</span>
+            </div>
+            <div class="connector" aria-hidden="true">
+                <span class="line"></span><span class="dot"></span><span class="dot d2"></span><span class="dot d3"></span>
+            </div>
+            <div class="center">
+                <div class="halo" aria-hidden="true"></div>
+                <div class="ring is-center"><img src="https://wooforger.dev/wooforger-logo.png" alt="WooForger" onerror="this.style.display='none'" /></div>
+                <span class="label is-center"><strong>WooForger</strong><br><span>Capa de integración</span></span>
+            </div>
+            <div class="connector" aria-hidden="true">
+                <span class="line"></span><span class="dot"></span><span class="dot d2"></span><span class="dot d3"></span>
+            </div>
+            <div class="side">
+                <div class="ring"><img src="https://http2.mlstatic.com/frontend-assets/ml-web-navigation/ui-navigation/6.6.83/mercadolibre/logo__small@2x.png" alt="MercadoLibre" /></div>
+                <span class="label">Publicaciones<br>en MercadoLibre</span>
+            </div>
+        </div>
+    </div>
+    <div class="body">
+        <h1>Confirmá tu cuenta MercadoLibre</h1>
+        <p class="intro">Estos son los datos de la cuenta que vamos a enviar a tu sitio
+            <span class="site-pill">${escapeHtml(siteUrl || 'tu WordPress')}</span>.
+            <strong>Antes de guardarlos</strong>, revisá que sea la cuenta correcta — la sesión activa en este browser puede no ser la que querés conectar.</p>
+
+        <div class="details">
+            <div class="row"><span class="k">Nickname</span><span class="v big">${escapeHtml(payload.nickname || '—')}</span></div>
+            <div class="row"><span class="k">Email</span><span class="v">${escapeHtml(payload.email || '—')}</span></div>
+            <div class="row"><span class="k">Sitio (país)</span><span class="v">${siteIdOk ? `<code>${escapeHtml(payload.site_id)}</code>` : '<em class="err">vacío</em>'}</span></div>
+            <div class="row"><span class="k">ML user_id</span><span class="v"><code>${payload.ml_user_id}</code></span></div>
+            <div class="row"><span class="k">access_token</span><span class="v"><span class="ok">✓ recibido (${String(payload.access_token).length} chars)</span> · válido por ${expHours}h</span></div>
+            <div class="row"><span class="k">refresh_token</span><span class="v">${hasRefresh ? `<span class="ok">✓ recibido (${String(payload.refresh_token).length} chars)</span>` : '<span class="err">✗ ausente — refresh automático no funcionará</span>'}</span></div>
+        </div>
+
+        ${warningsHtml}
+
+        <form method="POST" action="/connect-ml/finish" class="actions">
+            <input type="hidden" name="payload" value="${escapeHtml(payloadB64)}" />
+            <input type="hidden" name="return_to" value="${escapeHtml(returnTo)}" />
+            <input type="hidden" name="nonce" value="${escapeHtml(nonce)}" />
+            <input type="hidden" name="form_sig" value="${escapeHtml(formSig)}" />
+            <button type="submit" name="decision" value="cancel" class="btn btn-secondary">Cancelar (usar otra cuenta)</button>
+            <button type="submit" name="decision" value="confirm" class="btn btn-primary">Confirmar y conectar</button>
+        </form>
+
+        <p class="hint">Si esta no es la cuenta correcta: cancelá, cerrá sesión en mercadolibre.com.ar/argentina/menu/cuenta o cambiá de cuenta en el browser, y volvé a iniciar la conexión desde tu sitio.</p>
+    </div>
+</div>
+<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:24px;">wooforger-connect-ml · OAuth bridge</p>
 </body></html>`;
 }
 
@@ -280,21 +435,85 @@ app.get('/connect-ml/callback', async (req, res) => {
         ));
     }
 
-    // 4) Firmar payload y redirigir al return_to del cliente.
-    const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
-    const signature  = hmac(payloadB64);
+    // 4) En lugar de redirigir directo al plugin, mostramos pantalla de confirmación
+    //    para que el usuario verifique que la cuenta sea la correcta antes de que
+    //    sus tokens lleguen a su WordPress. El form postea a /connect-ml/finish con
+    //    los datos firmados; ahí se decide redirect o cancel.
+    res.type('html').send(confirmationPage({
+        payload,
+        returnTo: return_to,
+        nonce: String(nonce),
+        siteUrl: String(site_url || ''),
+    }));
+});
 
-    const finalUrl = new URL(return_to);
+// ============================================================================
+// POST /connect-ml/finish — el usuario confirmó o canceló la pantalla pre-handoff.
+//
+// Valida la firma del form (HMAC sobre payload|return_to|nonce) y según `decision`:
+//   - confirm: firma el payload con HUB_SECRET y redirige al return_to del plugin.
+//   - cancel:  redirige al return_to con ?wfml_cancel=1 (plugin muestra notice).
+// ============================================================================
+app.post(['/connect-ml/finish', '/finish'], (req, res) => {
+    const payloadB64 = String((req.body && req.body.payload)    || '');
+    const returnTo   = String((req.body && req.body.return_to)  || '');
+    const nonce      = String((req.body && req.body.nonce)      || '');
+    const formSig    = String((req.body && req.body.form_sig)   || '');
+    const decision   = String((req.body && req.body.decision)   || '');
+
+    if (!payloadB64 || !returnTo || !nonce || !formSig) {
+        return res.status(400).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ Form incompleto</h1>
+            <p>Faltan campos en el formulario de confirmación. Cerrá esta ventana y reintentá desde tu sitio.</p>`
+        ));
+    }
+    if (!isValidReturnTo(returnTo)) {
+        return res.status(400).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ return_to inválido</h1>`
+        ));
+    }
+
+    // Validar firma del form (anti-tampering).
+    const expectedSig = crypto.createHmac('sha256', HUB_SECRET)
+        .update(payloadB64 + '|' + returnTo + '|' + nonce)
+        .digest('base64');
+    const expectedBuf = Buffer.from(expectedSig);
+    const receivedBuf = Buffer.from(formSig);
+    if (expectedBuf.length !== receivedBuf.length ||
+        !crypto.timingSafeEqual(expectedBuf, receivedBuf)) {
+        return res.status(403).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ Firma inválida</h1>
+            <p>El formulario fue manipulado o el shared secret cambió. Reintentá desde tu sitio.</p>`
+        ));
+    }
+
+    // Decisión del usuario.
+    if (decision === 'cancel') {
+        // Volvemos al plugin con un flag de cancelación — sin payload ni firma.
+        const cancelUrl = new URL(returnTo);
+        cancelUrl.searchParams.set('nonce', nonce);
+        cancelUrl.searchParams.set('wfml_cancel', '1');
+        return res.type('html').send(htmlPage('Cancelado', `
+            <h1>Conexión cancelada</h1>
+            <p>No se guardó ninguna cuenta en tu sitio.</p>
+            <p style="margin-top:14px;"><a href="${escapeHtml(cancelUrl.toString())}">Volver al panel del plugin</a></p>
+            <script>setTimeout(function(){ window.location.href = ${JSON.stringify(cancelUrl.toString())}; }, 1500);</script>
+        `));
+    }
+
+    // Confirmar: re-firmamos el payload con el HMAC standard que espera el plugin
+    // y redirigimos. El plugin valida la firma y persiste.
+    const signature = hmac(payloadB64);
+    const finalUrl  = new URL(returnTo);
     finalUrl.searchParams.set('nonce', nonce);
     finalUrl.searchParams.set('payload', payloadB64);
     finalUrl.searchParams.set('signature', signature);
 
-    // Página de "redirigiendo" para que el user vea feedback antes del redirect.
     res.type('html').send(htmlPage('Conectando...', `
-        <h1 class="ok">✓ Conectaste tu cuenta MercadoLibre</h1>
-        <p>Volviendo al panel del plugin con tus credenciales...</p>
+        <h1 class="ok">✓ Listo, conectando tu cuenta...</h1>
+        <p>Volviendo a tu panel WooForger con las credenciales validadas.</p>
         <p style="margin-top:20px;font-size:12px;color:#9ca3af;">Si no se redirige automáticamente, <a href="${escapeHtml(finalUrl.toString())}">hacé click acá</a>.</p>
-        <script>setTimeout(function(){ window.location.href = ${JSON.stringify(finalUrl.toString())}; }, 1200);</script>
+        <script>setTimeout(function(){ window.location.href = ${JSON.stringify(finalUrl.toString())}; }, 1000);</script>
     `));
 });
 
@@ -314,9 +533,6 @@ app.get('/connect-ml/callback', async (req, res) => {
 //   { ok: true,  payload: <base64>, signature: <base64> }   — payload tiene los tokens nuevos
 //   { ok: false, error: <string> }
 // ============================================================================
-app.use(express.urlencoded({ extended: false, limit: '64kb' }));
-app.use(express.json({ limit: '64kb' }));
-
 app.post(['/refresh-token', '/connect-ml/refresh-token'], async (req, res) => {
     // IMPORTANTE: algunos reverse proxies interceptan cualquier 5xx upstream y
     // lo reemplazan por una pagina HTML de error generica, aplastando el body
