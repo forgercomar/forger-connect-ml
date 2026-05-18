@@ -42,6 +42,20 @@
 
 import express from 'express';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+// Versión del bridge — leído de package.json al arrancar. Se expone en /version
+// para que el cliente pueda verificar qué build está corriendo sin acceso al
+// container. Útil para diagnosticar "deploy aplicado vs. no aplicado".
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+let PKG_VERSION = 'unknown';
+try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+    PKG_VERSION = pkg.version || 'unknown';
+} catch (_) { /* ignore */ }
+const STARTED_AT = new Date().toISOString();
 
 // ============================================================================
 // Config — leído de env vars
@@ -69,6 +83,17 @@ app.disable('x-powered-by');
 
 // Trust proxy — el reverse proxy termina TLS y reenvía con X-Forwarded-*.
 app.set('trust proxy', true);
+
+// Anti-caché global. Cualquier respuesta del bridge debe ser fresh — sino
+// el reverse proxy o el browser pueden servir HTML viejo del deploy anterior
+// (ej. la pantalla "Conectaste tu cuenta" después de que la removimos).
+app.use((req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    res.set('X-Bridge-Version', PKG_VERSION);
+    next();
+});
 
 // Middleware de parsing — antes de los route handlers para que /connect-ml/finish
 // y /refresh-token reciban req.body parseado.
@@ -286,6 +311,19 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
 // ============================================================================
 app.get(['/healthz', '/connect-ml/healthz'], (req, res) => {
     res.json({ ok: true, ts: Date.now() });
+});
+
+// ============================================================================
+// GET /version — qué build está corriendo. Útil para verificar que un deploy
+// haya tomado efecto sin tener que entrar al container.
+// ============================================================================
+app.get(['/version', '/connect-ml/version'], (req, res) => {
+    res.json({
+        ok: true,
+        version: PKG_VERSION,
+        started_at: STARTED_AT,
+        ts: Date.now(),
+    });
 });
 
 // ============================================================================
