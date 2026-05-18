@@ -58,6 +58,63 @@ try {
 const STARTED_AT = new Date().toISOString();
 
 // ============================================================================
+// Storage simple en JSON file para el mapping ml_user_id → site_url.
+// El forwarder de webhooks lo usa para saber a dónde reenviar las notifications
+// que recibe del bridge cuando ML las manda a /connect-ml/webhooks.
+//
+// Se popula al confirmar OAuth en /connect-ml/finish (ahí tenemos return_to →
+// site_url + payload.ml_user_id). Si el bridge reinicia y se pierde el archivo,
+// los clientes existentes dejan de recibir webhooks hasta que reconecten.
+//
+// Para persistencia entre rebuilds, EasyPanel debe montar un volume en /data.
+// ============================================================================
+const DATA_DIR = process.env.DATA_DIR || '/data';
+const MAPPINGS_FILE = path.join(DATA_DIR, 'mappings.json');
+try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+} catch (e) {
+    console.warn('[mappings] no se pudo crear DATA_DIR ' + DATA_DIR + ': ' + e.message);
+}
+
+function loadMappings() {
+    try {
+        const raw = fs.readFileSync(MAPPINGS_FILE, 'utf8');
+        const parsed = JSON.parse(raw);
+        return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+function saveMappings(map) {
+    try {
+        fs.writeFileSync(MAPPINGS_FILE, JSON.stringify(map, null, 2), 'utf8');
+    } catch (e) {
+        console.error('[mappings] save error:', e.message);
+    }
+}
+
+function registerMapping(mlUserId, siteUrl) {
+    if (!mlUserId || !siteUrl) return;
+    const map = loadMappings();
+    const key = String(mlUserId);
+    const prev = map[key] || {};
+    map[key] = {
+        site_url:      siteUrl,
+        registered_at: prev.registered_at || Math.floor(Date.now() / 1000),
+        updated_at:    Math.floor(Date.now() / 1000),
+    };
+    saveMappings(map);
+    console.log(`[mappings] registered user=${mlUserId} site=${siteUrl}`);
+}
+
+function getMappingForUser(mlUserId) {
+    if (!mlUserId) return null;
+    const map = loadMappings();
+    return map[String(mlUserId)] || null;
+}
+
+// ============================================================================
 // Config — leído de env vars
 // ============================================================================
 const PORT             = Number(process.env.PORT || 3000);
@@ -327,6 +384,24 @@ app.get(['/version', '/connect-ml/version'], (req, res) => {
 });
 
 // ============================================================================
+// GET /mappings/count — diagnóstico simple para verificar que los mappings
+// ml_user_id → site_url se están persistiendo (sin exponer URLs sensibles).
+// ============================================================================
+app.get(['/mappings/count', '/connect-ml/mappings/count'], (req, res) => {
+    const map = loadMappings();
+    const keys = Object.keys(map);
+    res.json({
+        ok:           true,
+        count:        keys.length,
+        user_ids:     keys,
+        data_dir:     DATA_DIR,
+        data_dir_writable: (() => {
+            try { fs.accessSync(DATA_DIR, fs.constants.W_OK); return true; } catch (_) { return false; }
+        })(),
+    });
+});
+
+// ============================================================================
 // GET /connect-ml — inicio del flow. Recibe los params del cliente y redirige a ML.
 //
 //   site_url   identifica al cliente (solo informativo).
@@ -547,6 +622,18 @@ app.post(['/connect-ml/finish', '/finish'], (req, res) => {
     finalUrl.searchParams.set('payload', payloadB64);
     finalUrl.searchParams.set('signature', signature);
 
+    // Registrar mapping ml_user_id → site_url para forward de webhooks futuros.
+    // El site_url lo derivamos del returnTo (origin de la URL del admin del cliente).
+    try {
+        const decoded = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
+        const siteOrigin = new URL(returnTo).origin;
+        if (decoded.ml_user_id && siteOrigin) {
+            registerMapping(decoded.ml_user_id, siteOrigin);
+        }
+    } catch (e) {
+        console.warn('[finish] register mapping failed:', e.message);
+    }
+
     res.type('html').send(htmlPage('Conectando...', `
         <h1 class="ok">✓ Listo, conectando tu cuenta...</h1>
         <p>Volviendo a tu panel WooForger con las credenciales validadas.</p>
@@ -665,19 +752,54 @@ app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
     // 1. Responder 200 INMEDIATO. ML retry si > 1.5s o status != 200.
     res.status(200).json({ ok: true });
 
-    // 2. Log mínimo para que podamos ver actividad sin tener DB todavía.
-    //    Si el body es JSON parseado por express.json, accedemos directo.
-    //    Si vino como urlencoded o vacío, igual logueamos lo que haya.
-    try {
-        const body = req.body || {};
-        const topic    = String(body.topic    || '?');
-        const resource = String(body.resource || '?');
-        const userId   = body.user_id ? String(body.user_id) : '?';
-        const sent     = body.sent ? String(body.sent) : '';
-        console.log(`[webhook] topic=${topic} user=${userId} resource=${resource} sent=${sent}`);
-    } catch (e) {
-        console.error('[webhook] log error:', e.message);
+    // 2. Procesar fire-and-forget.
+    const body = req.body || {};
+    const topic    = String(body.topic    || '?');
+    const resource = String(body.resource || '?');
+    const userId   = body.user_id ? String(body.user_id) : '';
+    const sent     = body.sent ? String(body.sent) : '';
+    console.log(`[webhook] topic=${topic} user=${userId} resource=${resource} sent=${sent}`);
+
+    if (!userId) {
+        console.log('[webhook] payload sin user_id — no se puede forwardear');
+        return;
     }
+
+    // 3. Buscar mapping y reenviar al plugin del cliente.
+    const mapping = getMappingForUser(userId);
+    if (!mapping || !mapping.site_url) {
+        console.log(`[webhook] no mapping registrado para user=${userId} — skip forward`);
+        return;
+    }
+
+    // Body crudo serializado (lo que se va a firmar y reenviar al plugin).
+    let rawBody;
+    try {
+        rawBody = JSON.stringify(body);
+    } catch (e) {
+        console.error('[webhook] no se pudo serializar body:', e.message);
+        return;
+    }
+
+    const forwardUrl = mapping.site_url.replace(/\/$/, '') + '/wp-json/wfml/v1/webhook';
+    const sig = crypto.createHmac('sha256', HUB_SECRET).update(rawBody).digest('base64');
+
+    fetch(forwardUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type':       'application/json',
+            'X-Wfml-Bridge-Sig':  sig,
+            'X-Wfml-Bridge':      'wooforger-connect-ml/' + PKG_VERSION,
+            'User-Agent':         'wooforger-bridge-forwarder',
+        },
+        body: rawBody,
+        // 8s timeout — más que suficiente para que el plugin loguee + dispatch async.
+        signal: AbortSignal.timeout(8000),
+    }).then(r => {
+        console.log(`[webhook] forwarded user=${userId} → ${forwardUrl} status=${r.status}`);
+    }).catch(e => {
+        console.error(`[webhook] forward error user=${userId} → ${forwardUrl}: ${e.message}`);
+    });
 });
 
 // ============================================================================
