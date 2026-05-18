@@ -646,6 +646,41 @@ app.post(['/refresh-token', '/connect-ml/refresh-token'], async (req, res) => {
 });
 
 // ============================================================================
+// POST /connect-ml/webhooks — receptor de notifications de MercadoLibre.
+//
+// Este endpoint cumple dos roles:
+//   1. Hoy: STUB que responde 200 OK rápido para que ML acepte la URL en
+//      la configuración de la app y no marque el sitio como inalcanzable.
+//   2. Próximo: FORWARDER que identifique el seller por user_id del payload
+//      y reenvíe la notification al endpoint del plugin del cliente correspondiente
+//      (https://<site>/wp-json/wfml/v1/webhook), firmando el forward con HMAC.
+//
+// Topics que ML manda según permisos otorgados:
+//   - orders_v2, items, messages, shipments, claims, questions, etc.
+//
+// ML hace retry agresivo si no respondemos 200 en pocos segundos. Por eso
+// respondemos ANTES de cualquier procesamiento.
+// ============================================================================
+app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
+    // 1. Responder 200 INMEDIATO. ML retry si > 1.5s o status != 200.
+    res.status(200).json({ ok: true });
+
+    // 2. Log mínimo para que podamos ver actividad sin tener DB todavía.
+    //    Si el body es JSON parseado por express.json, accedemos directo.
+    //    Si vino como urlencoded o vacío, igual logueamos lo que haya.
+    try {
+        const body = req.body || {};
+        const topic    = String(body.topic    || '?');
+        const resource = String(body.resource || '?');
+        const userId   = body.user_id ? String(body.user_id) : '?';
+        const sent     = body.sent ? String(body.sent) : '';
+        console.log(`[webhook] topic=${topic} user=${userId} resource=${resource} sent=${sent}`);
+    } catch (e) {
+        console.error('[webhook] log error:', e.message);
+    }
+});
+
+// ============================================================================
 // GET / — pequeña landing informativa
 // ============================================================================
 app.get('/', (req, res) => {
