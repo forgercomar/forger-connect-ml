@@ -114,6 +114,30 @@ function getMappingForUser(mlUserId) {
     return map[String(mlUserId)] || null;
 }
 
+/**
+ * Deriva la URL raíz de WordPress desde el return_to del OAuth.
+ * WordPress puede vivir en subcarpeta (htdocs/wordpress/), entonces el return_to
+ * típico es:
+ *   https://misitio.com/wordpress/wp-admin/admin-post.php?action=wfml_oauth_callback
+ *
+ * Para forwardear webhooks correctamente necesitamos el path completo del WP root
+ * (https://misitio.com/wordpress), no solo el origin. Cortamos antes de /wp-admin/.
+ *
+ * Si el return_to ya viene root-relative (sin /wp-admin/, raro), devolvemos origin.
+ */
+function deriveSiteRootFromReturnTo(returnTo) {
+    try {
+        const u = new URL(returnTo);
+        let path = u.pathname || '';
+        const idx = path.toLowerCase().indexOf('/wp-admin/');
+        if (idx >= 0) path = path.substring(0, idx);
+        // Quitamos trailing slash para que el forwarder pueda hacer site + '/wp-json/...'.
+        return u.origin + path.replace(/\/+$/, '');
+    } catch (_) {
+        return null;
+    }
+}
+
 // ============================================================================
 // Config — leído de env vars
 // ============================================================================
@@ -622,13 +646,14 @@ app.post(['/connect-ml/finish', '/finish'], (req, res) => {
     finalUrl.searchParams.set('payload', payloadB64);
     finalUrl.searchParams.set('signature', signature);
 
-    // Registrar mapping ml_user_id → site_url para forward de webhooks futuros.
-    // El site_url lo derivamos del returnTo (origin de la URL del admin del cliente).
+    // Registrar mapping ml_user_id → site_url (WP root) para forward de webhooks.
+    // El site_url debe incluir el path donde vive WP (puede estar en subcarpeta
+    // tipo /wordpress/). Lo derivamos del returnTo cortando antes de /wp-admin/.
     try {
         const decoded = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
-        const siteOrigin = new URL(returnTo).origin;
-        if (decoded.ml_user_id && siteOrigin) {
-            registerMapping(decoded.ml_user_id, siteOrigin);
+        const siteRoot = deriveSiteRootFromReturnTo(returnTo);
+        if (decoded.ml_user_id && siteRoot) {
+            registerMapping(decoded.ml_user_id, siteRoot);
         }
     } catch (e) {
         console.warn('[finish] register mapping failed:', e.message);
