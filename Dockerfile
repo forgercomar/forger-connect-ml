@@ -6,6 +6,10 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 COPY server.js ./
 
+# Crear /data con permisos para el user "node" ANTES del USER directive.
+# Sin esto, EasyPanel monta el volume como root y el proceso node no puede
+# escribir → EACCES en /data/mappings.json.
+RUN mkdir -p /data && chown -R node:node /data
 USER node
 
 # Persistencia del archivo de mappings ml_user_id → site_url.
