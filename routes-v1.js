@@ -179,6 +179,12 @@ export function mountV1(app, opts = {}) {
     if (!HUB_SECRET) {
         throw new Error('mountV1: hubSecret requerido');
     }
+    // Registramos cada ruta con DOS paths: el "limpio" /v1/* y el prefijado
+    // /connect-ml/v1/*. Esto es por el reverse proxy de EasyPanel: el dominio
+    // wooforger.dev sirve a comingsoon en la raíz, y solo enruta /connect-ml/*
+    // hacia este container. Con ambas formas registradas, no importa si el
+    // proxy strippea o conserva el prefijo: la ruta siempre matchea.
+    const p = (path) => [path, '/connect-ml' + path];
 
     // -------------------------------------------------------------------------
     // POST /v1/handshake
@@ -197,7 +203,7 @@ export function mountV1(app, opts = {}) {
     // Idempotente sobre ml_user_id: si la cuenta ya existe, rota el secret y
     // actualiza site_url + refresh_token.
     // -------------------------------------------------------------------------
-    app.post('/v1/handshake', async (req, res) => {
+    app.post(p('/v1/handshake'), async (req, res) => {
         const body = req.body || {};
         const sigGiven = String(body.handshake_sig || '');
         if (!sigGiven) {
@@ -296,7 +302,7 @@ export function mountV1(app, opts = {}) {
     // Respuesta:
     //   { ok: true, job_id: "job_...", steps_total: N, status: "pending" }
     // -------------------------------------------------------------------------
-    app.post('/v1/jobs', authAccount, async (req, res) => {
+    app.post(p('/v1/jobs'), authAccount, async (req, res) => {
         const body = req.body || {};
         const type = String(body.type || '');
         if (!VALID_JOB_TYPES.has(type)) {
@@ -363,7 +369,7 @@ export function mountV1(app, opts = {}) {
     //   { ok: true, job: { id, type, status, steps_total, steps_done, steps_failed,
     //                      created_at, started_at, finished_at, message, result } }
     // -------------------------------------------------------------------------
-    app.get('/v1/jobs/:job_id', authAccount, async (req, res) => {
+    app.get(p('/v1/jobs/:job_id'), authAccount, async (req, res) => {
         const r = await query(
             `SELECT public_id, type, status, steps_total, steps_done, steps_failed,
                     input, result, created_at, started_at, finished_at, message
@@ -400,7 +406,7 @@ export function mountV1(app, opts = {}) {
     // El plugin debe procesar el step y luego llamar /report. Si tarda más del
     // lease (STEP_LEASE_SEC), otro pull puede tomarlo de nuevo (idempotencia).
     // -------------------------------------------------------------------------
-    app.post('/v1/jobs/:job_id/next-batch', authAccount, async (req, res) => {
+    app.post(p('/v1/jobs/:job_id/next-batch'), authAccount, async (req, res) => {
         // 1) Validar que el job pertenece a esta cuenta y no está finalizado.
         const j = await query(
             `SELECT id, status FROM jobs WHERE public_id = $1 AND account_id = $2`,
@@ -481,7 +487,7 @@ export function mountV1(app, opts = {}) {
     // Respuesta:
     //   { ok: true, job: { steps_done, steps_failed, status, message } }
     // -------------------------------------------------------------------------
-    app.post('/v1/jobs/:job_id/report', authAccount, async (req, res) => {
+    app.post(p('/v1/jobs/:job_id/report'), authAccount, async (req, res) => {
         const body = req.body || {};
         const stepId = String(body.step_id || '');
         const result = String(body.result  || '');
@@ -579,7 +585,7 @@ export function mountV1(app, opts = {}) {
     // POST /v1/jobs/:job_id/cancel
     // Marca el job y todos sus steps queued/leased como cancelled.
     // -------------------------------------------------------------------------
-    app.post('/v1/jobs/:job_id/cancel', authAccount, async (req, res) => {
+    app.post(p('/v1/jobs/:job_id/cancel'), authAccount, async (req, res) => {
         try {
             const r = await query(
                 `UPDATE jobs SET status = 'cancelled', finished_at = NOW(),
