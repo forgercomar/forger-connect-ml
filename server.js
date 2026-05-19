@@ -45,6 +45,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { mountV1 } from './routes-v1.js';
+import { ping as dbPing } from './db.js';
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
 // para que el cliente pueda verificar qué build está corriendo sin acceso al
@@ -178,8 +180,18 @@ app.use((req, res, next) => {
 
 // Middleware de parsing — antes de los route handlers para que /connect-ml/finish
 // y /refresh-token reciban req.body parseado.
+//
+// El body JSON crudo se stashea en req.rawBody (string) para que /v1/* pueda
+// verificar el HMAC sobre el contenido exacto que viajó por la red. Sin esto,
+// el re-stringify de express.json() podría no matchear bit a bit con lo que
+// el cliente firmó (orden de keys, espacios, etc.).
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({
+    limit: '4mb', // v1/jobs con miles de items necesita más
+    verify: (req, _res, buf) => {
+        req.rawBody = buf && buf.length ? buf.toString('utf8') : '';
+    },
+}));
 
 // ============================================================================
 // Helpers
@@ -385,13 +397,25 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
 }
 
 // ============================================================================
+// API v1 — Central Orchestrator
+// Endpoints /v1/* para que los plugins clientes orquesten jobs (sync, push, etc.)
+// vía el central. Auth con HMAC shared-secret por cuenta (ver routes-v1.js).
+// ============================================================================
+mountV1(app, { hubSecret: HUB_SECRET });
+
+// ============================================================================
 // GET /healthz — liveness check para el reverse proxy.
 // Registrado en ambas formas porque algunos reverse proxies no strippean el
 // path prefix del dominio (https://example/connect-ml/healthz puede llegar al
 // container literal como /connect-ml/healthz).
+// Si la DB no es accesible, devolvemos { ok: false, db: false } pero status
+// 200 para no romper el healthcheck del proxy: el OAuth bridge sigue
+// funcionando aunque la DB esté caída.
 // ============================================================================
-app.get(['/healthz', '/connect-ml/healthz'], (req, res) => {
-    res.json({ ok: true, ts: Date.now() });
+app.get(['/healthz', '/connect-ml/healthz'], async (req, res) => {
+    let dbOk = false;
+    try { dbOk = await dbPing(); } catch (_) { dbOk = false; }
+    res.json({ ok: true, db: dbOk, ts: Date.now() });
 });
 
 // ============================================================================
