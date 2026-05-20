@@ -710,6 +710,55 @@ export function mountV1(app, opts = {}) {
     });
 
     // -------------------------------------------------------------------------
+    // GET /v1/orders/pending
+    // Órdenes ML ya procesadas (el central bajó la orden de ML) que el plugin
+    // todavía no aplicó a su ledger de stock. Una fila por orden — la más
+    // reciente procesada, porque una orden puede generar varios webhooks. El
+    // plugin descuenta/repone stock según el status.
+    //
+    // Respuesta:
+    //   { ok: true, orders: [{ ml_order_id, status, items: [...] }] }
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/orders/pending'), authAccount, async (req, res) => {
+        const r = await query(
+            `SELECT DISTINCT ON (ml_order_id)
+                    ml_order_id, order_status, items_json
+             FROM order_events
+             WHERE account_id = $1
+               AND processed_at IS NOT NULL
+               AND delivered_at IS NULL
+               AND error IS NULL
+             ORDER BY ml_order_id, processed_at DESC`,
+            [req.account.id]
+        );
+        const orders = r.rows.map((row) => ({
+            ml_order_id: row.ml_order_id,
+            status:      row.order_status,
+            items:       Array.isArray(row.items_json) ? row.items_json : [],
+        }));
+        return res.json({ ok: true, orders });
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /v1/orders/ack
+    // Body: { ml_order_ids: ["123", ...] }
+    // El plugin confirma que aplicó esas órdenes a su ledger. Marcamos todas
+    // las order_events de esas órdenes como delivered.
+    // -------------------------------------------------------------------------
+    app.post(p('/v1/orders/ack'), authAccount, async (req, res) => {
+        const ids = Array.isArray(req.body && req.body.ml_order_ids)
+            ? req.body.ml_order_ids.map(String).filter(Boolean)
+            : [];
+        if (!ids.length) return res.json({ ok: true, marked: 0 });
+        const r = await query(
+            `UPDATE order_events SET delivered_at = NOW()
+             WHERE account_id = $1 AND ml_order_id = ANY($2::text[]) AND delivered_at IS NULL`,
+            [req.account.id, ids]
+        );
+        return res.json({ ok: true, marked: r.rowCount });
+    });
+
+    // -------------------------------------------------------------------------
     // POST /v1/jobs/:job_id/cancel
     // Marca el job y todos sus steps queued/leased como cancelled.
     // -------------------------------------------------------------------------

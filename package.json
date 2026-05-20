@@ -1,6 +1,6 @@
 {
   "name": "wooforger-connect-ml",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "private": true,
   "description": "OAuth bridge + central orchestrator de WooForger para MercadoLibre.",
   "type": "module",

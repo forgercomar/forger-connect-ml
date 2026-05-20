@@ -799,7 +799,8 @@ app.post(['/refresh-token', '/connect-ml/refresh-token'], async (req, res) => {
 // ML hace retry agresivo si no respondemos 200 en pocos segundos: respondemos
 // ANTES de cualquier procesamiento.
 // ============================================================================
-const WEBHOOK_ITEM_TOPICS = new Set(['items', 'items_prices']);
+const WEBHOOK_ITEM_TOPICS  = new Set(['items', 'items_prices']);
+const WEBHOOK_ORDER_TOPICS = new Set(['orders_v2', 'orders']);
 
 app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
     // 1. Responder 200 INMEDIATO. ML retry si > 1.5s o status != 200.
@@ -816,17 +817,27 @@ app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
         console.log('[webhook] payload sin user_id — descartado');
         return;
     }
-    if (!WEBHOOK_ITEM_TOPICS.has(topic)) {
-        // orders_v2, messages, etc. — fuera del scope actual (solo items).
+
+    const isItem  = WEBHOOK_ITEM_TOPICS.has(topic);
+    const isOrder = WEBHOOK_ORDER_TOPICS.has(topic);
+    if (!isItem && !isOrder) {
+        // messages, shipments, claims, etc. — fuera del scope actual.
         return;
     }
-    // Extraer el ml_item_id del resource: "/items/MLA123" o "/items/MLA123/prices".
-    const m = resource.match(/\/items\/([A-Za-z0-9]+)/);
-    if (!m) {
-        console.log(`[webhook] resource sin item_id parseable: ${resource}`);
+
+    // Extraer el id del recurso: "/items/MLA123[/prices]" o "/orders/123".
+    let resourceId = '';
+    if (isItem) {
+        const m = resource.match(/\/items\/([A-Za-z0-9]+)/);
+        resourceId = m ? m[1] : '';
+    } else {
+        const m = resource.match(/\/orders\/(\d+)/);
+        resourceId = m ? m[1] : '';
+    }
+    if (!resourceId) {
+        console.log(`[webhook] resource sin id parseable: ${resource}`);
         return;
     }
-    const mlItemId = m[1];
 
     // 3. Resolver la cuenta y encolar el evento. Fire-and-forget.
     (async () => {
@@ -839,12 +850,22 @@ app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
                 console.log(`[webhook] sin cuenta registrada para user=${userId} — descartado`);
                 return;
             }
-            await dbQuery(
-                `INSERT INTO webhook_events (account_id, ml_item_id, topic)
-                 VALUES ($1, $2, $3)`,
-                [acc.rows[0].id, mlItemId, topic]
-            );
-            console.log(`[webhook] evento encolado item=${mlItemId} cuenta=${acc.rows[0].id}`);
+            const accountId = acc.rows[0].id;
+            if (isItem) {
+                await dbQuery(
+                    `INSERT INTO webhook_events (account_id, ml_item_id, topic)
+                     VALUES ($1, $2, $3)`,
+                    [accountId, resourceId, topic]
+                );
+                console.log(`[webhook] item encolado item=${resourceId} cuenta=${accountId}`);
+            } else {
+                await dbQuery(
+                    `INSERT INTO order_events (account_id, ml_order_id)
+                     VALUES ($1, $2)`,
+                    [accountId, resourceId]
+                );
+                console.log(`[webhook] orden encolada order=${resourceId} cuenta=${accountId}`);
+            }
         } catch (e) {
             console.error('[webhook] no se pudo encolar evento:', e.message);
         }

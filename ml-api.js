@@ -167,6 +167,20 @@ export async function mlSearchItems(account, accessToken, offset, limit) {
 }
 
 /**
+ * Trae una orden completa de ML.
+ *   GET /orders/{id}
+ *
+ * @returns {Promise<object>} la orden ML (status, order_items, etc.)
+ */
+export async function mlGetOrder(account, accessToken, orderId) {
+    const r = await mlGet(account, `/orders/${encodeURIComponent(orderId)}`, accessToken);
+    if (!r.ok || !r.data) {
+        throw new Error(`orders/${orderId} falló: HTTP ${r.status}`);
+    }
+    return r.data;
+}
+
+/**
  * Multi-get de items. ML acepta hasta 20 ids; el caller debe chunkear.
  *   GET /items?ids=A,B,C&attributes=...
  *

@@ -44,6 +44,7 @@
 
 import { query } from './db.js';
 import { generatePublicId } from './auth.js';
+import { getValidAccessToken, mlGetOrder } from './ml-api.js';
 
 const AUTOSYNC_ENABLED = process.env.WFML_AUTOSYNC_ENABLED !== '0';
 const INTERVAL_HOURS   = Math.max(1, Number(process.env.WFML_AUTOSYNC_INTERVAL_HOURS) || 6);
@@ -52,6 +53,9 @@ const CHECK_INTERVAL   = Math.max(60000, Number(process.env.WFML_AUTOSYNC_CHECK_
 const WEBHOOK_ENABLED        = process.env.WFML_WEBHOOK_ENABLED !== '0';
 const WEBHOOK_BATCH_INTERVAL = Math.max(15000, Number(process.env.WFML_WEBHOOK_BATCH_INTERVAL) || 60000);
 
+const ORDER_ENABLED  = process.env.WFML_ORDER_ENABLED !== '0';
+const ORDER_INTERVAL = Math.max(15000, Number(process.env.WFML_ORDER_INTERVAL) || 60000);
+
 // Delay del primer chequeo — le da tiempo a la DB y al worker a estar listos
 // después de un deploy antes de empezar a encolar.
 const FIRST_RUN_DELAY = 30000;
@@ -59,6 +63,7 @@ const FIRST_RUN_DELAY = 30000;
 // Evita que dos chequeos del mismo loop se solapen si la DB está lenta.
 let _busy = false;
 let _webhookBusy = false;
+let _orderBusy = false;
 
 /**
  * Busca las cuentas activas que necesitan un sync automático y encola un
@@ -194,6 +199,106 @@ async function webhookTick() {
 }
 
 // ----------------------------------------------------------------------------
+// Procesador de órdenes (ledger de stock)
+// ----------------------------------------------------------------------------
+
+/**
+ * Extrae los items vendidos de una orden ML en el shape que consume el plugin.
+ */
+function extractOrderItems(order) {
+    const items = Array.isArray(order.order_items) ? order.order_items : [];
+    return items.map((oi) => {
+        const it = (oi && oi.item) || {};
+        return {
+            sku:          String(it.seller_sku || it.seller_custom_field || ''),
+            quantity:     Number(oi.quantity) || 0,
+            ml_item_id:   String(it.id || ''),
+            variation_id: it.variation_id != null ? Number(it.variation_id) : null,
+        };
+    });
+}
+
+/**
+ * Toma las order_events sin procesar, baja cada orden de ML y guarda en la
+ * fila su estado + items vendidos. El plugin después las baja y las aplica a
+ * su ledger de stock.
+ *
+ * Dedup: varios webhooks de la misma orden (la orden cambia de estado varias
+ * veces) se procesan bajando la orden UNA vez — todas las filas de ese
+ * ml_order_id se completan juntas. La idempotencia real (no descontar dos
+ * veces) la garantiza el plugin con el ml_order_id como clave en su log.
+ *
+ * Si bajar la orden falla, la fila queda sin procesar y se reintenta en el
+ * próximo tick — no se pierde la venta.
+ */
+async function processOrderEvents() {
+    const pend = await query(
+        `SELECT id, account_id, ml_order_id
+         FROM order_events
+         WHERE processed_at IS NULL
+         ORDER BY account_id, id
+         LIMIT 500`
+    );
+    if (!pend.rowCount) return 0;
+
+    // Agrupar por cuenta; dentro de cada cuenta, dedup por ml_order_id.
+    const byAccount = new Map();
+    for (const row of pend.rows) {
+        let orders = byAccount.get(row.account_id);
+        if (!orders) { orders = new Map(); byAccount.set(row.account_id, orders); }
+        let evIds = orders.get(row.ml_order_id);
+        if (!evIds) { evIds = []; orders.set(row.ml_order_id, evIds); }
+        evIds.push(row.id);
+    }
+
+    let processed = 0;
+    for (const [accountId, orders] of byAccount) {
+        let account, token;
+        try {
+            const accR = await query(`SELECT * FROM accounts WHERE id = $1`, [accountId]);
+            if (!accR.rowCount || accR.rows[0].revoked_at) continue;
+            account = accR.rows[0];
+            token = await getValidAccessToken(account);
+        } catch (err) {
+            console.error(`[scheduler] orders: cuenta ${accountId} sin token — se reintenta:`, err.message);
+            continue;
+        }
+        for (const [mlOrderId, evIds] of orders) {
+            try {
+                const order = await mlGetOrder(account, token, mlOrderId);
+                const status = String(order.status || '');
+                const items = extractOrderItems(order);
+                await query(
+                    `UPDATE order_events
+                     SET processed_at = NOW(), order_status = $2, items_json = $3, error = NULL
+                     WHERE id = ANY($1::bigint[])`,
+                    [evIds, status, JSON.stringify(items)]
+                );
+                processed++;
+                console.log(`[scheduler] orden ${mlOrderId} procesada — status=${status}, ${items.length} item(s)`);
+            } catch (err) {
+                // No marcamos processed_at → se reintenta el próximo tick.
+                console.error(`[scheduler] orden ${mlOrderId} falló (se reintenta):`, err.message);
+            }
+        }
+    }
+    return processed;
+}
+
+async function orderTick() {
+    if (_orderBusy) return;
+    _orderBusy = true;
+    try {
+        const n = await processOrderEvents();
+        if (n > 0) console.log(`[scheduler] ${n} orden(es) procesada(s)`);
+    } catch (err) {
+        console.error('[scheduler] order tick error:', err.message);
+    } finally {
+        _orderBusy = false;
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Arranque
 // ----------------------------------------------------------------------------
 
@@ -221,5 +326,16 @@ export function startScheduler() {
         }, FIRST_RUN_DELAY);
     } else {
         console.log('[scheduler] webhook debouncer deshabilitado (WFML_WEBHOOK_ENABLED=0)');
+    }
+
+    // Loop 3 — procesador de órdenes (ledger de stock).
+    if (ORDER_ENABLED) {
+        console.log(`[scheduler] procesador de órdenes — cada ${Math.round(ORDER_INTERVAL / 1000)}s`);
+        setTimeout(() => {
+            orderTick().catch((e) => console.error('[scheduler] first order tick uncaught:', e));
+            setInterval(() => { orderTick().catch((e) => console.error('[scheduler] order tick uncaught:', e)); }, ORDER_INTERVAL);
+        }, FIRST_RUN_DELAY);
+    } else {
+        console.log('[scheduler] procesador de órdenes deshabilitado (WFML_ORDER_ENABLED=0)');
     }
 }
