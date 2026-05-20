@@ -92,6 +92,22 @@ function variationThumb(variation, item) {
 }
 
 /**
+ * Nombre legible de una variation: título del item + los atributos concretos
+ * (color/talle/etc) que la distinguen, p.ej. "Remera Lisa — Negro / M".
+ * ML no le da título propio a las variantes; lo componemos de
+ * attribute_combinations. Sin atributos, cae al título del item.
+ */
+function variationLabel(item, variation) {
+    const combos = Array.isArray(variation.attribute_combinations)
+        ? variation.attribute_combinations : [];
+    const parts = combos
+        .map((c) => String((c && (c.value_name || c.value_id)) || '').trim())
+        .filter(Boolean);
+    const base = String(item.title || '');
+    return parts.length ? (base + ' — ' + parts.join(' / ')) : base;
+}
+
+/**
  * Arma el row completo para wf_ml_items (sin account_id — lo pone el plugin
  * al aplicar, porque el id de cuenta local lo conoce solo él).
  *
@@ -108,7 +124,7 @@ function buildItemRow(item, variation, hasVariations) {
             ml_item_id:               String(item.id),
             parent_item_id:           String(item.id),
             variation_id:             Number(variation.id),
-            title:                    String(item.title || ''),
+            title:                    variationLabel(item, variation),
             sku:                      extractSku(variation),
             price:                    variation.price != null ? Number(variation.price) : 0,
             available_quantity:       variation.available_quantity != null ? Number(variation.available_quantity) : 0,
