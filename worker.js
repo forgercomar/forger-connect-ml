@@ -56,6 +56,32 @@ function extractSku(node) {
 }
 
 /**
+ * Extrae info de cuotas del item ML. Porta wfml_sync_extract_installments
+ * del plugin PHP:
+ *   - Si viene item.installments con quantity → ese es el N real.
+ *     rate=0 → sin interés.
+ *   - Fallback por listing_type_id:
+ *       gold_pro / gold_premium → no_interest=1, max=null  (badge "Sin interés")
+ *       otros                   → max=0, no_interest=null  (badge "Clásica")
+ *       sin listing_type        → ambos null               (badge "Definir")
+ */
+function extractInstallments(item) {
+    if (item.installments && typeof item.installments === 'object') {
+        const qty = Number(item.installments.quantity) || 0;
+        if (qty > 0) {
+            const rate = Number(item.installments.rate) || 0;
+            return { installments_max: qty, installments_no_interest: rate === 0 ? 1 : 0 };
+        }
+    }
+    const lt = String(item.listing_type_id || '').toLowerCase();
+    if (lt === '') return { installments_max: null, installments_no_interest: null };
+    if (lt === 'gold_pro' || lt === 'gold_premium') {
+        return { installments_max: null, installments_no_interest: 1 };
+    }
+    return { installments_max: 0, installments_no_interest: null };
+}
+
+/**
  * Thumbnail de una variation (usa picture_ids) con fallback al del item.
  */
 function variationThumb(variation, item) {
@@ -74,6 +100,9 @@ function variationThumb(variation, item) {
  * @param {boolean} hasVariations  si el item tiene variantes
  */
 function buildItemRow(item, variation, hasVariations) {
+    // Las cuotas son del item entero (ML no permite cuotas por variante);
+    // las variantes heredan las del padre.
+    const inst = extractInstallments(item);
     if (variation) {
         return {
             ml_item_id:               String(item.id),
@@ -89,8 +118,8 @@ function buildItemRow(item, variation, hasVariations) {
             thumbnail:                variationThumb(variation, item),
             has_variations:           0,
             variations_json:          null,
-            installments_max:         null,
-            installments_no_interest: null,
+            installments_max:         inst.installments_max,
+            installments_no_interest: inst.installments_no_interest,
             category_id:              String(item.category_id || ''),
         };
     }
@@ -109,8 +138,8 @@ function buildItemRow(item, variation, hasVariations) {
         has_variations:           hasVariations ? 1 : 0,
         variations_json:          hasVariations && Array.isArray(item.variations)
                                     ? JSON.stringify(item.variations) : null,
-        installments_max:         null,
-        installments_no_interest: null,
+        installments_max:         inst.installments_max,
+        installments_no_interest: inst.installments_no_interest,
         category_id:              String(item.category_id || ''),
     };
 }
