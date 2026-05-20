@@ -210,6 +210,50 @@ async function jobIsActive(jobId) {
 }
 
 /**
+ * Procesa un job "targeted": una lista explícita de ml_item_ids (típicamente
+ * originada por webhooks). En vez de paginar todo el catálogo del seller,
+ * trae solo esos items con multi-get. Mucho más liviano y rápido.
+ */
+async function processTargetedSync(job, account, token, ids) {
+    const unique = [...new Set(ids)];
+    const stepsTotal = Math.max(1, Math.ceil(unique.length / ML_BATCH_SIZE));
+    await query(
+        `UPDATE jobs SET steps_total = $2, steps_done = 0, message = $3 WHERE id = $1`,
+        [job.id, stepsTotal, `Actualizando ${unique.length} publicación(es) modificada(s)...`]
+    );
+
+    let processed = 0;
+    let stepsDone = 0;
+    for (let i = 0; i < unique.length; i += ML_BATCH_SIZE) {
+        if (!(await jobIsActive(job.id))) {
+            console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
+            return;
+        }
+        const chunk = unique.slice(i, i + ML_BATCH_SIZE);
+        // mlGetItems descarta los ids que ML no devuelve con code 200 (item
+        // borrado, etc.) — esos simplemente no se actualizan.
+        const items = await mlGetItems(account, token, chunk);
+        const rows = expandItemsToRows(items);
+        await insertSyncedItems(account.id, job.id, rows);
+        processed += items.length;
+        stepsDone++;
+        await query(
+            `UPDATE jobs SET steps_done = $2, message = $3, last_seen_at = NOW() WHERE id = $1`,
+            [job.id, stepsDone, `Actualizadas ${processed} de ${unique.length}...`]
+        );
+    }
+
+    await query(
+        `UPDATE jobs SET status = 'done', finished_at = NOW(), result = $2, message = $3
+         WHERE id = $1 AND status = 'running'`,
+        [job.id,
+         JSON.stringify({ items_synced: processed, total: unique.length, mode: 'targeted' }),
+         `Actualización completa: ${processed} publicación(es).`]
+    );
+    console.log(`[worker] job ${job.public_id} done (targeted) — ${processed} items`);
+}
+
+/**
  * Procesa un job de tipo sync_full / sync_incremental.
  */
 async function processSyncJob(job) {
@@ -221,6 +265,16 @@ async function processSyncJob(job) {
 
     // 2) Token de ML.
     const token = await getValidAccessToken(account);
+
+    // 2b) Modo "targeted": si el job trae una lista explícita de items
+    //     (ej. agrupados desde webhooks), sincronizamos solo esos.
+    const input = (job.input && typeof job.input === 'object') ? job.input : {};
+    const targetIds = Array.isArray(input.ml_item_ids)
+        ? input.ml_item_ids.map(String).filter(Boolean)
+        : [];
+    if (targetIds.length > 0) {
+        return await processTargetedSync(job, account, token, targetIds);
+    }
 
     // 3) Primera búsqueda para conocer el total.
     const first = await mlSearchItems(account, token, 0, SYNC_CHUNK);

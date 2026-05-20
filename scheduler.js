@@ -22,13 +22,22 @@
  * viejo que INTERVAL_HOURS. Así un sync manual reciente "cuenta" y el cron
  * no duplica trabajo; y un job fallido no se reintenta en loop cerrado.
  *
+ * El scheduler corre DOS loops independientes:
+ *   - autosync:  cada cuenta sin sync reciente → job sync_full periódico.
+ *   - webhook debouncer: agrupa los webhook_events pendientes por cuenta y
+ *     encola un job sync_incremental targeted con la lista de items.
+ *
  * Variables de entorno:
- *   WFML_AUTOSYNC_ENABLED         '0' apaga el cron (default: encendido)
+ *   WFML_AUTOSYNC_ENABLED         '0' apaga el cron de autosync (default: on)
  *   WFML_AUTOSYNC_INTERVAL_HOURS  cada cuántas horas resincronizar una cuenta
  *                                 (default 6)
- *   WFML_AUTOSYNC_CHECK_INTERVAL  ms entre chequeos del scheduler (default
- *                                 600000 = 10 min). El chequeo es barato:
- *                                 una query + N inserts.
+ *   WFML_AUTOSYNC_CHECK_INTERVAL  ms entre chequeos del autosync (default
+ *                                 600000 = 10 min)
+ *   WFML_WEBHOOK_ENABLED          '0' apaga el debouncer de webhooks (default: on)
+ *   WFML_WEBHOOK_BATCH_INTERVAL   ms entre agrupaciones de webhooks (default
+ *                                 60000 = 1 min). Más bajo = más "tiempo real"
+ *                                 pero más jobs; el debounce existe para no
+ *                                 disparar un job por cada webhook suelto.
  *
  * @module scheduler
  */
@@ -40,12 +49,16 @@ const AUTOSYNC_ENABLED = process.env.WFML_AUTOSYNC_ENABLED !== '0';
 const INTERVAL_HOURS   = Math.max(1, Number(process.env.WFML_AUTOSYNC_INTERVAL_HOURS) || 6);
 const CHECK_INTERVAL   = Math.max(60000, Number(process.env.WFML_AUTOSYNC_CHECK_INTERVAL) || 600000);
 
+const WEBHOOK_ENABLED        = process.env.WFML_WEBHOOK_ENABLED !== '0';
+const WEBHOOK_BATCH_INTERVAL = Math.max(15000, Number(process.env.WFML_WEBHOOK_BATCH_INTERVAL) || 60000);
+
 // Delay del primer chequeo — le da tiempo a la DB y al worker a estar listos
 // después de un deploy antes de empezar a encolar.
 const FIRST_RUN_DELAY = 30000;
 
-// Evita que dos chequeos se solapen si la DB está lenta.
+// Evita que dos chequeos del mismo loop se solapen si la DB está lenta.
 let _busy = false;
+let _webhookBusy = false;
 
 /**
  * Busca las cuentas activas que necesitan un sync automático y encola un
@@ -108,17 +121,105 @@ async function tick() {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Webhook debouncer
+// ----------------------------------------------------------------------------
+
 /**
- * Arranca el loop del scheduler. Llamado una vez desde server.js.
+ * Agrupa los webhook_events pendientes por cuenta y encola un job
+ * sync_incremental targeted (input.ml_item_ids) por cada cuenta con cambios.
+ *
+ * Orden seguro: leemos los pendientes, creamos el job y RECIÉN ahí marcamos
+ * esos eventos como procesados. Si la creación del job falla, los eventos
+ * quedan sin marcar y se reintentan en el próximo tick — sin pérdida. Un
+ * webhook que llega entre el SELECT y el UPDATE no estaba en el batch, así
+ * que tampoco se pierde: lo toma la próxima vuelta.
+ *
+ * @returns {Promise<number>} cantidad de jobs encolados.
+ */
+async function processWebhookBatch() {
+    const pend = await query(
+        `SELECT id, account_id, ml_item_id
+         FROM webhook_events
+         WHERE processed_at IS NULL
+         ORDER BY account_id, id
+         LIMIT 5000`
+    );
+    if (!pend.rowCount) return 0;
+
+    // Agrupar por cuenta: items únicos + ids de evento a marcar.
+    const byAccount = new Map();
+    for (const row of pend.rows) {
+        let g = byAccount.get(row.account_id);
+        if (!g) { g = { itemIds: new Set(), eventIds: [] }; byAccount.set(row.account_id, g); }
+        g.itemIds.add(row.ml_item_id);
+        g.eventIds.push(row.id);
+    }
+
+    let jobs = 0;
+    for (const [accountId, g] of byAccount) {
+        const itemIds = [...g.itemIds];
+        try {
+            const jobPublic = generatePublicId('job');
+            await query(
+                `INSERT INTO jobs (public_id, account_id, type, status, input, steps_total)
+                 VALUES ($1, $2, 'sync_incremental', 'pending', $3, 0)`,
+                [jobPublic, accountId, JSON.stringify({ source: 'webhook', ml_item_ids: itemIds })]
+            );
+            // Job creado OK → marcar SOLO esos eventos como procesados.
+            await query(
+                `UPDATE webhook_events SET processed_at = NOW() WHERE id = ANY($1::bigint[])`,
+                [g.eventIds]
+            );
+            jobs++;
+            console.log(`[scheduler] webhook batch → job ${jobPublic} (cuenta ${accountId}, ${itemIds.length} item(s))`);
+        } catch (err) {
+            console.error(`[scheduler] no se pudo encolar webhook batch cuenta ${accountId}:`, err.message);
+            // No marcamos processed → se reintenta en el próximo tick.
+        }
+    }
+    return jobs;
+}
+
+async function webhookTick() {
+    if (_webhookBusy) return;
+    _webhookBusy = true;
+    try {
+        await processWebhookBatch();
+    } catch (err) {
+        console.error('[scheduler] webhook tick error:', err.message);
+    } finally {
+        _webhookBusy = false;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Arranque
+// ----------------------------------------------------------------------------
+
+/**
+ * Arranca los loops del scheduler. Llamado una vez desde server.js.
  */
 export function startScheduler() {
-    if (!AUTOSYNC_ENABLED) {
-        console.log('[scheduler] deshabilitado (WFML_AUTOSYNC_ENABLED=0)');
-        return;
+    // Loop 1 — autosync periódico.
+    if (AUTOSYNC_ENABLED) {
+        console.log(`[scheduler] autosync — resync cada ${INTERVAL_HOURS}h, chequeo cada ${Math.round(CHECK_INTERVAL / 1000)}s`);
+        setTimeout(() => {
+            tick().catch((e) => console.error('[scheduler] first autosync tick uncaught:', e));
+            setInterval(() => { tick().catch((e) => console.error('[scheduler] autosync tick uncaught:', e)); }, CHECK_INTERVAL);
+        }, FIRST_RUN_DELAY);
+    } else {
+        console.log('[scheduler] autosync deshabilitado (WFML_AUTOSYNC_ENABLED=0)');
     }
-    console.log(`[scheduler] arrancando — resync cada ${INTERVAL_HOURS}h, chequeo cada ${Math.round(CHECK_INTERVAL / 1000)}s`);
-    setTimeout(() => {
-        tick().catch((e) => console.error('[scheduler] first tick uncaught:', e));
-        setInterval(() => { tick().catch((e) => console.error('[scheduler] tick uncaught:', e)); }, CHECK_INTERVAL);
-    }, FIRST_RUN_DELAY);
+
+    // Loop 2 — webhook debouncer.
+    if (WEBHOOK_ENABLED) {
+        console.log(`[scheduler] webhook debouncer — agrupando cada ${Math.round(WEBHOOK_BATCH_INTERVAL / 1000)}s`);
+        setTimeout(() => {
+            webhookTick().catch((e) => console.error('[scheduler] first webhook tick uncaught:', e));
+            setInterval(() => { webhookTick().catch((e) => console.error('[scheduler] webhook tick uncaught:', e)); }, WEBHOOK_BATCH_INTERVAL);
+        }, FIRST_RUN_DELAY);
+    } else {
+        console.log('[scheduler] webhook debouncer deshabilitado (WFML_WEBHOOK_ENABLED=0)');
+    }
 }

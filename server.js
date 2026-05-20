@@ -46,7 +46,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { mountV1 } from './routes-v1.js';
-import { ping as dbPing } from './db.js';
+import { ping as dbPing, query as dbQuery } from './db.js';
 import { startWorker } from './worker.js';
 import { startScheduler } from './scheduler.js';
 
@@ -110,12 +110,6 @@ function registerMapping(mlUserId, siteUrl) {
     };
     saveMappings(map);
     console.log(`[mappings] registered user=${mlUserId} site=${siteUrl}`);
-}
-
-function getMappingForUser(mlUserId) {
-    if (!mlUserId) return null;
-    const map = loadMappings();
-    return map[String(mlUserId)] || null;
 }
 
 /**
@@ -786,19 +780,27 @@ app.post(['/refresh-token', '/connect-ml/refresh-token'], async (req, res) => {
 // ============================================================================
 // POST /connect-ml/webhooks — receptor de notifications de MercadoLibre.
 //
-// Este endpoint cumple dos roles:
-//   1. Hoy: STUB que responde 200 OK rápido para que ML acepte la URL en
-//      la configuración de la app y no marque el sitio como inalcanzable.
-//   2. Próximo: FORWARDER que identifique el seller por user_id del payload
-//      y reenvíe la notification al endpoint del plugin del cliente correspondiente
-//      (https://<site>/wp-json/wfml/v1/webhook), firmando el forward con HMAC.
+// Modelo pull (no forward): ML avisa que cambió algo de una publicación; el
+// central NO reenvía la notification al WordPress del cliente (eso exigiría
+// que el WP sea públicamente accesible — muchos no lo son). En su lugar:
 //
-// Topics que ML manda según permisos otorgados:
-//   - orders_v2, items, messages, shipments, claims, questions, etc.
+//   1. Identifica la cuenta por user_id.
+//   2. Extrae el ml_item_id afectado del `resource`.
+//   3. Encola el evento en webhook_events.
 //
-// ML hace retry agresivo si no respondemos 200 en pocos segundos. Por eso
-// respondemos ANTES de cualquier procesamiento.
+// El debouncer del scheduler agrupa esos eventos por cuenta y encola un job
+// sync_incremental; el plugin baja el resultado en su próximo poll. Así el
+// tiempo real funciona aunque el WP del cliente no sea alcanzable desde fuera.
+//
+// Topics que ML manda según permisos: orders_v2, items, items_prices,
+// messages, shipments, etc. Acá solo procesamos los de items — el resto se
+// loguea y se descarta (orders_v2 entrará con el ledger de stock).
+//
+// ML hace retry agresivo si no respondemos 200 en pocos segundos: respondemos
+// ANTES de cualquier procesamiento.
 // ============================================================================
+const WEBHOOK_ITEM_TOPICS = new Set(['items', 'items_prices']);
+
 app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
     // 1. Responder 200 INMEDIATO. ML retry si > 1.5s o status != 200.
     res.status(200).json({ ok: true });
@@ -808,49 +810,45 @@ app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
     const topic    = String(body.topic    || '?');
     const resource = String(body.resource || '?');
     const userId   = body.user_id ? String(body.user_id) : '';
-    const sent     = body.sent ? String(body.sent) : '';
-    console.log(`[webhook] topic=${topic} user=${userId} resource=${resource} sent=${sent}`);
+    console.log(`[webhook] topic=${topic} user=${userId} resource=${resource}`);
 
     if (!userId) {
-        console.log('[webhook] payload sin user_id — no se puede forwardear');
+        console.log('[webhook] payload sin user_id — descartado');
         return;
     }
-
-    // 3. Buscar mapping y reenviar al plugin del cliente.
-    const mapping = getMappingForUser(userId);
-    if (!mapping || !mapping.site_url) {
-        console.log(`[webhook] no mapping registrado para user=${userId} — skip forward`);
+    if (!WEBHOOK_ITEM_TOPICS.has(topic)) {
+        // orders_v2, messages, etc. — fuera del scope actual (solo items).
         return;
     }
-
-    // Body crudo serializado (lo que se va a firmar y reenviar al plugin).
-    let rawBody;
-    try {
-        rawBody = JSON.stringify(body);
-    } catch (e) {
-        console.error('[webhook] no se pudo serializar body:', e.message);
+    // Extraer el ml_item_id del resource: "/items/MLA123" o "/items/MLA123/prices".
+    const m = resource.match(/\/items\/([A-Za-z0-9]+)/);
+    if (!m) {
+        console.log(`[webhook] resource sin item_id parseable: ${resource}`);
         return;
     }
+    const mlItemId = m[1];
 
-    const forwardUrl = mapping.site_url.replace(/\/$/, '') + '/wp-json/wfml/v1/webhook';
-    const sig = crypto.createHmac('sha256', HUB_SECRET).update(rawBody).digest('base64');
-
-    fetch(forwardUrl, {
-        method: 'POST',
-        headers: {
-            'Content-Type':       'application/json',
-            'X-Wfml-Bridge-Sig':  sig,
-            'X-Wfml-Bridge':      'wooforger-connect-ml/' + PKG_VERSION,
-            'User-Agent':         'wooforger-bridge-forwarder',
-        },
-        body: rawBody,
-        // 8s timeout — más que suficiente para que el plugin loguee + dispatch async.
-        signal: AbortSignal.timeout(8000),
-    }).then(r => {
-        console.log(`[webhook] forwarded user=${userId} → ${forwardUrl} status=${r.status}`);
-    }).catch(e => {
-        console.error(`[webhook] forward error user=${userId} → ${forwardUrl}: ${e.message}`);
-    });
+    // 3. Resolver la cuenta y encolar el evento. Fire-and-forget.
+    (async () => {
+        try {
+            const acc = await dbQuery(
+                `SELECT id FROM accounts WHERE ml_user_id = $1 AND revoked_at IS NULL LIMIT 1`,
+                [Number(userId)]
+            );
+            if (!acc.rowCount) {
+                console.log(`[webhook] sin cuenta registrada para user=${userId} — descartado`);
+                return;
+            }
+            await dbQuery(
+                `INSERT INTO webhook_events (account_id, ml_item_id, topic)
+                 VALUES ($1, $2, $3)`,
+                [acc.rows[0].id, mlItemId, topic]
+            );
+            console.log(`[webhook] evento encolado item=${mlItemId} cuenta=${acc.rows[0].id}`);
+        } catch (e) {
+            console.error('[webhook] no se pudo encolar evento:', e.message);
+        }
+    })();
 });
 
 // ============================================================================
