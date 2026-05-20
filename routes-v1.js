@@ -311,12 +311,13 @@ export function mountV1(app, opts = {}) {
         const params = body.params && typeof body.params === 'object' ? body.params : {};
         const jobPublic = generatePublicId('job');
 
-        // Los jobs sync_* NO pre-crean steps: el worker del central los procesa
-        // descubriendo el total contra ML y paginando solo. Los jobs push /
-        // auto_link_sku sí pre-crean steps (modelo A: el plugin los ejecuta).
-        const isSyncJob = (type === 'sync_full' || type === 'sync_incremental');
+        // Jobs ejecutados por el worker del central (sync_* y push): NO pre-crean
+        // steps — el worker los procesa solo (pagina ML, o ejecuta los PUT del
+        // push masivo). auto_link_sku sigue siendo modelo A: pre-crea steps que
+        // el plugin ejecuta.
+        const isWorkerJob = (type === 'sync_full' || type === 'sync_incremental' || type === 'push');
 
-        if (isSyncJob) {
+        if (isWorkerJob) {
             try {
                 await query(
                     `INSERT INTO jobs (public_id, account_id, type, status, input, steps_total)

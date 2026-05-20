@@ -28,6 +28,7 @@ import {
     getValidAccessToken,
     mlSearchItems,
     mlGetItems,
+    mlUpdateItem,
     ML_BATCH_SIZE,
 } from './ml-api.js';
 
@@ -456,6 +457,104 @@ async function processIncrementalSync(job, account, token) {
 }
 
 // ----------------------------------------------------------------------------
+// Procesamiento de un job de push (push masivo Web → ML)
+// ----------------------------------------------------------------------------
+
+/**
+ * Extrae un mensaje legible del cuerpo de error de ML.
+ */
+function mlErrorMessage(res) {
+    const d = res && res.data;
+    if (d) {
+        if (Array.isArray(d.cause) && d.cause.length) {
+            const msg = d.cause
+                .map((c) => (c && (c.message || c.code)) || '')
+                .filter(Boolean).join('; ');
+            if (msg) return msg;
+        }
+        if (d.message) return String(d.message);
+    }
+    return `HTTP ${res ? res.status : '?'}`;
+}
+
+/**
+ * Procesa un job `push`: ejecuta los PUT contra ML que el plugin ya dejó
+ * armados. El plugin calculó cada body (precio/stock/variations) con sus datos
+ * de WooCommerce — el central solo los manda y reporta cómo fue.
+ *
+ * input.pushes = [{ ml_item_id, body, apply?, variation_id? }]
+ *   body  → cuerpo del PUT /items/{id}.
+ *   apply → blob opaco que el plugin necesita para sincronizar su cache; el
+ *           central no lo interpreta, solo lo devuelve tal cual en el result.
+ *
+ * El resultado por item queda en result.items; el plugin lo baja con
+ * GET /v1/jobs/:id, aplica los OK a su cache y loguea los que fallaron.
+ */
+async function processPushJob(job) {
+    const accR = await query(`SELECT * FROM accounts WHERE id = $1`, [job.account_id]);
+    if (!accR.rowCount) throw new Error('cuenta no encontrada');
+    const account = accR.rows[0];
+    if (account.revoked_at) throw new Error('cuenta revocada');
+    const token = await getValidAccessToken(account);
+
+    const input  = (job.input && typeof job.input === 'object') ? job.input : {};
+    const pushes = Array.isArray(input.pushes) ? input.pushes : [];
+    const total  = pushes.length;
+
+    await query(
+        `UPDATE jobs SET steps_total = $2, steps_done = 0, message = $3 WHERE id = $1`,
+        [job.id, total, `Pusheando ${total} publicación(es) a Mercado Libre...`]
+    );
+
+    const results = [];
+    let pushed = 0, failed = 0, done = 0;
+
+    for (const pu of pushes) {
+        if (!(await jobIsActive(job.id))) {
+            console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
+            return;
+        }
+        const mlItemId = String((pu && pu.ml_item_id) || '');
+        const body     = (pu && pu.body && typeof pu.body === 'object') ? pu.body : null;
+        let r;
+        if (!mlItemId || !body) {
+            r = { ml_item_id: mlItemId, ok: false, http_code: 0, error: 'push inválido (sin ml_item_id o body)' };
+        } else {
+            try {
+                const res = await mlUpdateItem(account, token, mlItemId, body);
+                r = {
+                    ml_item_id: mlItemId,
+                    ok: res.ok,
+                    http_code: res.status,
+                    error: res.ok ? null : mlErrorMessage(res),
+                };
+            } catch (err) {
+                r = { ml_item_id: mlItemId, ok: false, http_code: 0, error: err.message };
+            }
+        }
+        // Passthrough: el plugin necesita estos campos para sincronizar su cache.
+        if (pu && pu.apply !== undefined) r.apply = pu.apply;
+        if (pu && pu.variation_id !== undefined) r.variation_id = pu.variation_id;
+        results.push(r);
+        if (r.ok) pushed++; else failed++;
+        done++;
+        await query(
+            `UPDATE jobs SET steps_done = $2, message = $3, last_seen_at = NOW() WHERE id = $1`,
+            [job.id, done, `Pusheadas ${done}/${total} — ${pushed} OK, ${failed} con error...`]
+        );
+    }
+
+    await query(
+        `UPDATE jobs SET status = 'done', finished_at = NOW(), result = $2, message = $3
+         WHERE id = $1 AND status = 'running'`,
+        [job.id,
+         JSON.stringify({ mode: 'push', total, pushed, failed, items: results }),
+         `Push masivo: ${pushed} OK, ${failed} con error (de ${total}).`]
+    );
+    console.log(`[worker] job ${job.public_id} done (push) — ${pushed} OK, ${failed} fail`);
+}
+
+// ----------------------------------------------------------------------------
 // Loop principal
 // ----------------------------------------------------------------------------
 
@@ -469,7 +568,7 @@ async function claimJob() {
          WHERE id = (
             SELECT id FROM jobs
             WHERE status = 'pending'
-              AND type IN ('sync_full', 'sync_incremental')
+              AND type IN ('sync_full', 'sync_incremental', 'push')
             ORDER BY created_at ASC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -487,7 +586,7 @@ async function tick() {
         if (!job) return;
         console.log(`[worker] tomando job ${job.public_id} (${job.type})`);
         try {
-            await processSyncJob(job);
+            await (job.type === 'push' ? processPushJob(job) : processSyncJob(job));
         } catch (err) {
             console.error(`[worker] job ${job.public_id} falló:`, err.message);
             await query(

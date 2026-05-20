@@ -185,6 +185,36 @@ export async function mlGetOrder(account, accessToken, orderId) {
 }
 
 /**
+ * PUT /items/{id} — actualiza un item de ML (precio, stock, o el array de
+ * variations). El body lo arma el plugin; esta capa solo lo manda. Reintenta
+ * 1 vez si recibe 401 (refrescando el token).
+ *
+ * @param {object} body  cuerpo del PUT (ej. { price, available_quantity } o
+ *                        { variations: [...] }).
+ * @returns {Promise<{ ok: boolean, status: number, data: object|null }>}
+ */
+export async function mlUpdateItem(account, accessToken, itemId, body, _isRetry = false) {
+    const url = `${ML_API}/items/${encodeURIComponent(itemId)}`;
+    const resp = await fetch(url, {
+        method: 'PUT',
+        headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify(body || {}),
+    });
+    if (resp.status === 401 && !_isRetry) {
+        const fresh = await refreshAccessToken(account);
+        return mlUpdateItem(account, fresh, itemId, body, true);
+    }
+    const raw = await resp.text();
+    let data;
+    try { data = JSON.parse(raw); } catch (_) { data = null; }
+    return { ok: resp.ok, status: resp.status, data };
+}
+
+/**
  * Multi-get de items. ML acepta hasta 20 ids; el caller debe chunkear.
  *   GET /items?ids=A,B,C&attributes=...
  *
