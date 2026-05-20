@@ -670,6 +670,46 @@ export function mountV1(app, opts = {}) {
     });
 
     // -------------------------------------------------------------------------
+    // GET /v1/sync/pending
+    // ¿Hay resultados de sync sin bajar para esta cuenta? Lo usa el plugin al
+    // cargar el admin para detectar los syncs que dejó el cron automático
+    // mientras el operador no estaba.
+    //
+    // Devuelve la lista de jobs con synced_items pendientes (delivered_at NULL),
+    // del más viejo al más nuevo, para que el plugin los baje en orden.
+    //
+    // Solo se reportan jobs en estado 'done': mientras el worker todavía está
+    // paginando ('running') va insertando synced_items, y si el plugin drenara
+    // + ack en ese momento marcaría como entregadas filas que el worker
+    // todavía no terminó de escribir. Esperando a 'done' la descarga es segura.
+    //
+    // Respuesta:
+    //   { ok: true, pending: bool, jobs: [{ job_id, count, synced_at }], total }
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/sync/pending'), authAccount, async (req, res) => {
+        const r = await query(
+            `SELECT j.public_id AS job_id,
+                    COUNT(si.id)::int AS count,
+                    MAX(si.synced_at) AS synced_at
+             FROM synced_items si
+             JOIN jobs j ON j.id = si.job_id
+             WHERE si.account_id = $1
+               AND si.delivered_at IS NULL
+               AND j.status = 'done'
+             GROUP BY j.public_id
+             ORDER BY MAX(si.synced_at) ASC`,
+            [req.account.id]
+        );
+        const jobs = r.rows.map((row) => ({
+            job_id: row.job_id,
+            count: row.count,
+            synced_at: row.synced_at,
+        }));
+        const total = jobs.reduce((s, j) => s + j.count, 0);
+        return res.json({ ok: true, pending: jobs.length > 0, jobs, total });
+    });
+
+    // -------------------------------------------------------------------------
     // POST /v1/jobs/:job_id/cancel
     // Marca el job y todos sus steps queued/leased como cancelled.
     // -------------------------------------------------------------------------

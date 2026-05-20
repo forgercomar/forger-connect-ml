@@ -5,8 +5,8 @@ COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
 # Copiar fuentes — módulos del Sprint 1 (db, auth, routes-v1, migrate) +
-# Sprint 2 (ml-api, worker).
-COPY server.js db.js auth.js routes-v1.js migrate.js ml-api.js worker.js ./
+# Sprint 2 (ml-api, worker) + Sprint 3 (scheduler).
+COPY server.js db.js auth.js routes-v1.js migrate.js ml-api.js worker.js scheduler.js ./
 COPY db ./db
 COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
