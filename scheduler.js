@@ -23,7 +23,9 @@
  * no duplica trabajo; y un job fallido no se reintenta en loop cerrado.
  *
  * El scheduler corre DOS loops independientes:
- *   - autosync:  cada cuenta sin sync reciente → job sync_full periódico.
+ *   - autosync:  cada cuenta sin sync reciente → job sync_incremental; cada
+ *     FULL_HOURS uno de esos syncs es un sync_full de cobertura total (la red
+ *     de seguridad que recupera lo que webhooks + incremental dejaron pasar).
  *   - webhook debouncer: agrupa los webhook_events pendientes por cuenta y
  *     encola un job sync_incremental targeted con la lista de items.
  *
@@ -31,6 +33,9 @@
  *   WFML_AUTOSYNC_ENABLED         '0' apaga el cron de autosync (default: on)
  *   WFML_AUTOSYNC_INTERVAL_HOURS  cada cuántas horas resincronizar una cuenta
  *                                 (default 6)
+ *   WFML_AUTOSYNC_FULL_HOURS      cada cuántas horas el sync periódico es un
+ *                                 sync_full de cobertura total (default 24);
+ *                                 entre fulls el cron encola sync_incremental
  *   WFML_AUTOSYNC_CHECK_INTERVAL  ms entre chequeos del autosync (default
  *                                 600000 = 10 min)
  *   WFML_WEBHOOK_ENABLED          '0' apaga el debouncer de webhooks (default: on)
@@ -49,6 +54,9 @@ import { getValidAccessToken, mlGetOrder } from './ml-api.js';
 const AUTOSYNC_ENABLED = process.env.WFML_AUTOSYNC_ENABLED !== '0';
 const INTERVAL_HOURS   = Math.max(1, Number(process.env.WFML_AUTOSYNC_INTERVAL_HOURS) || 6);
 const CHECK_INTERVAL   = Math.max(60000, Number(process.env.WFML_AUTOSYNC_CHECK_INTERVAL) || 600000);
+// Cada cuántas horas el sync periódico es un sync_full de cobertura total.
+// Entre fulls el cron encola sync_incremental (mucho más liviano).
+const FULL_HOURS       = Math.max(INTERVAL_HOURS, Number(process.env.WFML_AUTOSYNC_FULL_HOURS) || 24);
 
 const WEBHOOK_ENABLED        = process.env.WFML_WEBHOOK_ENABLED !== '0';
 const WEBHOOK_BATCH_INTERVAL = Math.max(15000, Number(process.env.WFML_WEBHOOK_BATCH_INTERVAL) || 60000);
@@ -66,16 +74,27 @@ let _webhookBusy = false;
 let _orderBusy = false;
 
 /**
- * Busca las cuentas activas que necesitan un sync automático y encola un
- * job sync_full para cada una. Devuelve cuántos jobs creó.
+ * Busca las cuentas activas que necesitan un sync automático y encola un job
+ * para cada una. Por defecto encola sync_incremental; si la cuenta no tuvo un
+ * sync_full exitoso en las últimas FULL_HOURS, encola sync_full (red de
+ * seguridad). Devuelve cuántos jobs creó.
  */
 async function scheduleDueAccounts() {
     // Cuentas activas que:
     //   (a) no tienen un job de sync pending/running (no pisar trabajo en curso), y
     //   (b) no tuvieron NINGÚN job de sync en las últimas INTERVAL_HOURS
     //       (ni manual ni de cron) — o nunca tuvieron uno.
+    // `needs_full` = no hubo un sync_full exitoso en las últimas FULL_HOURS
+    //   (incluye la cuenta que nunca se sincronizó) → toca un full.
     const due = await query(
-        `SELECT a.id, a.public_id
+        `SELECT a.id, a.public_id,
+                NOT EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.account_id = a.id
+                      AND j.type = 'sync_full'
+                      AND j.status = 'done'
+                      AND j.created_at > NOW() - ($2 || ' hours')::interval
+                ) AS needs_full
          FROM accounts a
          WHERE a.revoked_at IS NULL
            AND NOT EXISTS (
@@ -90,22 +109,23 @@ async function scheduleDueAccounts() {
                  AND j.type IN ('sync_full', 'sync_incremental')
                  AND j.created_at > NOW() - ($1 || ' hours')::interval
            )`,
-        [String(INTERVAL_HOURS)]
+        [String(INTERVAL_HOURS), String(FULL_HOURS)]
     );
 
     if (!due.rowCount) return 0;
 
     let created = 0;
     for (const acc of due.rows) {
+        const type = acc.needs_full ? 'sync_full' : 'sync_incremental';
         try {
             const jobPublic = generatePublicId('job');
             await query(
                 `INSERT INTO jobs (public_id, account_id, type, status, input, steps_total)
-                 VALUES ($1, $2, 'sync_full', 'pending', $3, 0)`,
-                [jobPublic, acc.id, JSON.stringify({ source: 'cron' })]
+                 VALUES ($1, $2, $3, 'pending', $4, 0)`,
+                [jobPublic, acc.id, type, JSON.stringify({ source: 'cron' })]
             );
             created++;
-            console.log(`[scheduler] encolado sync automático ${jobPublic} para cuenta ${acc.public_id}`);
+            console.log(`[scheduler] encolado ${type} automático ${jobPublic} para cuenta ${acc.public_id}`);
         } catch (err) {
             console.error(`[scheduler] no se pudo encolar para cuenta ${acc.public_id}:`, err.message);
         }

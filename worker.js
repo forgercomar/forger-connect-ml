@@ -35,6 +35,12 @@ const WORKER_ENABLED  = process.env.WFML_WORKER_ENABLED !== '0';
 const WORKER_INTERVAL = Math.max(2000, Number(process.env.WFML_WORKER_INTERVAL) || 5000);
 const SYNC_CHUNK      = Math.max(1, Math.min(50, Number(process.env.WFML_SYNC_CHUNK) || 50));
 
+// Margen de seguridad del sync incremental: al watermark se le restan estos ms
+// antes de comparar contra el `last_updated` de cada item. Sobre-traer items
+// sin cambios es inofensivo (upsert idempotente del lado del plugin); perder
+// uno por desfasaje de reloj o empate de orden, no — por eso el corte es generoso.
+const INCREMENTAL_MARGIN_MS = 60 * 60 * 1000; // 1 hora
+
 // Flag para evitar que dos ticks se solapen si un job tarda más que el intervalo.
 let _busy = false;
 
@@ -292,6 +298,13 @@ async function processSyncJob(job) {
         return await processTargetedSync(job, account, token, targetIds);
     }
 
+    // 2c) Modo "incremental": si el job es sync_incremental y la cuenta ya
+    //     tiene watermark, traemos solo lo modificado desde ahí. Sin watermark
+    //     (primer sync de la cuenta) cae al full de abajo — que lo deja seteado.
+    if (job.type === 'sync_incremental' && account.last_sync_at) {
+        return await processIncrementalSync(job, account, token);
+    }
+
     // 3) Primera búsqueda para conocer el total.
     const first = await mlSearchItems(account, token, 0, SYNC_CHUNK);
     const total = first.total;
@@ -341,7 +354,8 @@ async function processSyncJob(job) {
         await handlePage(page.ids);
     }
 
-    // 6) Done.
+    // 6) Done. Un sync full (o el primer incremental, que cae acá por no tener
+    //    watermark) deja la cuenta con cobertura total → avanzamos la marca.
     await query(
         `UPDATE jobs SET status = 'done', finished_at = NOW(),
                          result = $2,
@@ -351,7 +365,94 @@ async function processSyncJob(job) {
          JSON.stringify({ items_synced: processed, total }),
          `Sync completo: ${processed} publicaciones.`]
     );
+    await advanceWatermark(account.id, job.started_at);
     console.log(`[worker] job ${job.public_id} done — ${processed} items`);
+}
+
+/**
+ * Avanza accounts.last_sync_at al `started_at` del job — el watermark desde el
+ * cual el próximo sync_incremental considera un item "modificado". Se usa el
+ * INICIO del job (no el fin) para no dejar afuera nada que haya cambiado
+ * mientras el sync corría.
+ */
+async function advanceWatermark(accountId, startedAt) {
+    if (!startedAt) return;
+    await query(`UPDATE accounts SET last_sync_at = $2 WHERE id = $1`, [accountId, startedAt]);
+}
+
+/**
+ * Procesa un job sync_incremental real: trae SOLO los items de ML modificados
+ * desde el watermark de la cuenta (accounts.last_sync_at).
+ *
+ * ML no expone un filtro "items modificados desde X", pero su items/search sí
+ * ordena por `last_updated`. Paginamos con orders=last_updated_desc (lo más
+ * reciente primero), multi-get de cada página para conocer el `last_updated`
+ * real de cada item, y CORTAMOS apenas una página trae un item por debajo del
+ * umbral — de ahí en más todo es más viejo. Así solo se recorren las páginas
+ * que tienen cambios.
+ *
+ * Al watermark se le resta INCREMENTAL_MARGIN_MS de margen. Sin cambios, el job
+ * termina con 0 items (el plugin lo ve como "catálogo al día").
+ */
+async function processIncrementalSync(job, account, token) {
+    const sinceMs = new Date(account.last_sync_at).getTime() - INCREMENTAL_MARGIN_MS;
+    const luMs = (it) => (it && it.last_updated ? new Date(it.last_updated).getTime() : 0);
+
+    await query(
+        `UPDATE jobs SET steps_total = 0, steps_done = 0, message = $2 WHERE id = $1`,
+        [job.id, 'Buscando publicaciones modificadas...']
+    );
+
+    let processed = 0;
+    let pages = 0;
+    let reachedCutoff = false;
+    let total = 0;
+
+    for (let offset = 0; ; offset += SYNC_CHUNK) {
+        if (!(await jobIsActive(job.id))) {
+            console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
+            return;
+        }
+        const page = await mlSearchItems(account, token, offset, SYNC_CHUNK, 'last_updated_desc');
+        total = page.total;
+        if (!page.ids.length) break;
+
+        // Multi-get de la página para conocer el last_updated de cada item.
+        const items = [];
+        for (let i = 0; i < page.ids.length; i += ML_BATCH_SIZE) {
+            const chunk = page.ids.slice(i, i + ML_BATCH_SIZE);
+            items.push(...await mlGetItems(account, token, chunk));
+        }
+
+        // Items modificados después del watermark → a staging.
+        const fresh = items.filter((it) => luMs(it) >= sinceMs);
+        if (fresh.length) {
+            await insertSyncedItems(account.id, job.id, expandItemsToRows(fresh));
+            processed += fresh.length;
+        }
+        pages++;
+        await query(
+            `UPDATE jobs SET steps_done = $2, message = $3, last_seen_at = NOW() WHERE id = $1`,
+            [job.id, pages, `Revisando cambios — ${processed} publicación(es) modificada(s)...`]
+        );
+
+        // La página viene ordenada last_updated_desc: si algún item ya cayó
+        // bajo el umbral, todo lo que sigue es más viejo → no hay nada más.
+        if (items.some((it) => luMs(it) < sinceMs)) { reachedCutoff = true; break; }
+        if (offset + SYNC_CHUNK >= total) break;
+    }
+
+    await query(
+        `UPDATE jobs SET status = 'done', finished_at = NOW(), result = $2, message = $3
+         WHERE id = $1 AND status = 'running'`,
+        [job.id,
+         JSON.stringify({ items_synced: processed, mode: 'incremental', pages_scanned: pages, reached_cutoff: reachedCutoff }),
+         processed > 0
+            ? `Sync incremental: ${processed} publicación(es) actualizada(s).`
+            : 'Sync incremental: catálogo al día, sin cambios.']
+    );
+    await advanceWatermark(account.id, job.started_at);
+    console.log(`[worker] job ${job.public_id} done (incremental) — ${processed} items, ${pages} página(s)`);
 }
 
 // ----------------------------------------------------------------------------
@@ -373,7 +474,7 @@ async function claimJob() {
             FOR UPDATE SKIP LOCKED
             LIMIT 1
          )
-         RETURNING id, public_id, account_id, type, input`
+         RETURNING id, public_id, account_id, type, input, started_at`
     );
     return r.rowCount ? r.rows[0] : null;
 }

@@ -149,13 +149,17 @@ export async function mlGet(account, path, accessToken, _isRetry = false) {
 
 /**
  * Lista los IDs de items del seller, paginado.
- *   GET /users/{uid}/items/search?offset=&limit=
+ *   GET /users/{uid}/items/search?offset=&limit=[&orders=]
  *
+ * @param {string} [orders] criterio de orden de ML (ej. 'last_updated_desc').
+ *   Vacío = orden por defecto. El sync incremental lo usa para paginar de más
+ *   reciente a más viejo y cortar al cruzar el watermark.
  * @returns {Promise<{ ids: string[], total: number }>}
  */
-export async function mlSearchItems(account, accessToken, offset, limit) {
+export async function mlSearchItems(account, accessToken, offset, limit, orders = '') {
     const uid = Number(account.ml_user_id);
-    const path = `/users/${uid}/items/search?offset=${offset}&limit=${limit}`;
+    let path = `/users/${uid}/items/search?offset=${offset}&limit=${limit}`;
+    if (orders) path += `&orders=${encodeURIComponent(orders)}`;
     const r = await mlGet(account, path, accessToken);
     if (!r.ok || !r.data) {
         throw new Error(`items/search falló: HTTP ${r.status} ${(r.data && r.data.message) || ''}`);
