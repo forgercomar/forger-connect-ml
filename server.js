@@ -47,6 +47,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { mountV1 } from './routes-v1.js';
 import { ping as dbPing } from './db.js';
+import { startWorker } from './worker.js';
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
 // para que el cliente pueda verificar qué build está corriendo sin acceso al
@@ -883,4 +884,8 @@ app.listen(PORT, () => {
     console.log(`[wooforger-connect-ml] listening on :${PORT}`);
     console.log(`[wooforger-connect-ml] BASE_URL = ${BASE_URL}`);
     console.log(`[wooforger-connect-ml] CALLBACK_URL = ${CALLBACK_URL}`);
+    // Arranca el worker del Central Orchestrator (procesa jobs de sync).
+    // Si la DB no está disponible, el worker logguea el error y reintenta
+    // en el próximo tick — no tumba el proceso.
+    startWorker();
 });

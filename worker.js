@@ -1,0 +1,317 @@
+/**
+ * worker.js — Worker del Central Orchestrator.
+ *
+ * Loop interno (setInterval) que procesa los jobs de sincronización:
+ *
+ *   1. Toma un job `pending` de tipo sync_* (lock con FOR UPDATE SKIP LOCKED).
+ *   2. Resuelve la cuenta + un access_token válido de ML.
+ *   3. Pagina /users/{uid}/items/search, trae los items con multi-get, arma
+ *      el row para wf_ml_items y lo inserta en `synced_items`.
+ *   4. Va actualizando jobs.steps_done para que el plugin vea el progreso.
+ *   5. Marca el job `done` (o `failed` si algo explotó).
+ *
+ * El worker corre EN EL MISMO proceso que el server Express. Node es
+ * single-thread pero todo el I/O (ML API, Postgres) es async, así que el
+ * event loop no se bloquea. Para escalar a muchos clientes simultáneos se
+ * puede mover a un proceso aparte — el lock SKIP LOCKED ya lo hace seguro.
+ *
+ * Variables de entorno:
+ *   WFML_WORKER_ENABLED   '0' para apagar el worker (default: encendido)
+ *   WFML_WORKER_INTERVAL  ms entre ticks (default 5000)
+ *   WFML_SYNC_CHUNK       items por página de ML (default 50, max 50 = cap ML)
+ *
+ * @module worker
+ */
+
+import { query, tx } from './db.js';
+import {
+    getValidAccessToken,
+    mlSearchItems,
+    mlGetItems,
+    ML_BATCH_SIZE,
+} from './ml-api.js';
+
+const WORKER_ENABLED  = process.env.WFML_WORKER_ENABLED !== '0';
+const WORKER_INTERVAL = Math.max(2000, Number(process.env.WFML_WORKER_INTERVAL) || 5000);
+const SYNC_CHUNK      = Math.max(1, Math.min(50, Number(process.env.WFML_SYNC_CHUNK) || 50));
+
+// Flag para evitar que dos ticks se solapen si un job tarda más que el intervalo.
+let _busy = false;
+
+// ----------------------------------------------------------------------------
+// Construcción del row para wf_ml_items
+// ----------------------------------------------------------------------------
+
+/**
+ * SKU de un item ML: lo busca en seller_custom_field o en attributes.
+ */
+function extractSku(node) {
+    if (node.seller_custom_field) return String(node.seller_custom_field);
+    if (Array.isArray(node.attributes)) {
+        for (const a of node.attributes) {
+            if (a && a.id === 'SELLER_SKU') return String(a.value_name || '');
+        }
+    }
+    return '';
+}
+
+/**
+ * Thumbnail de una variation (usa picture_ids) con fallback al del item.
+ */
+function variationThumb(variation, item) {
+    if (variation.picture_ids && variation.picture_ids[0]) {
+        return 'https://http2.mlstatic.com/D_NQ_NP_' + variation.picture_ids[0] + '-V.webp';
+    }
+    return String(item.thumbnail || '');
+}
+
+/**
+ * Arma el row completo para wf_ml_items (sin account_id — lo pone el plugin
+ * al aplicar, porque el id de cuenta local lo conoce solo él).
+ *
+ * @param {object} item       item ML completo
+ * @param {object|null} variation  si != null, arma el row de esa variante
+ * @param {boolean} hasVariations  si el item tiene variantes
+ */
+function buildItemRow(item, variation, hasVariations) {
+    if (variation) {
+        return {
+            ml_item_id:               String(item.id),
+            parent_item_id:           String(item.id),
+            variation_id:             Number(variation.id),
+            title:                    String(item.title || ''),
+            sku:                      extractSku(variation),
+            price:                    variation.price != null ? Number(variation.price) : 0,
+            available_quantity:       variation.available_quantity != null ? Number(variation.available_quantity) : 0,
+            sold_quantity:            item.sold_quantity != null ? Number(item.sold_quantity) : 0,
+            status:                   String(item.status || ''),
+            permalink:                String(item.permalink || ''),
+            thumbnail:                variationThumb(variation, item),
+            has_variations:           0,
+            variations_json:          null,
+            installments_max:         null,
+            installments_no_interest: null,
+            category_id:              String(item.category_id || ''),
+        };
+    }
+    return {
+        ml_item_id:               String(item.id),
+        parent_item_id:           null,
+        variation_id:             null,
+        title:                    String(item.title || ''),
+        sku:                      extractSku(item),
+        price:                    item.price != null ? Number(item.price) : 0,
+        available_quantity:       item.available_quantity != null ? Number(item.available_quantity) : 0,
+        sold_quantity:            item.sold_quantity != null ? Number(item.sold_quantity) : 0,
+        status:                   String(item.status || ''),
+        permalink:                String(item.permalink || ''),
+        thumbnail:                String(item.thumbnail || ''),
+        has_variations:           hasVariations ? 1 : 0,
+        variations_json:          hasVariations && Array.isArray(item.variations)
+                                    ? JSON.stringify(item.variations) : null,
+        installments_max:         null,
+        installments_no_interest: null,
+        category_id:              String(item.category_id || ''),
+    };
+}
+
+// ----------------------------------------------------------------------------
+// Persistencia de items en staging
+// ----------------------------------------------------------------------------
+
+/**
+ * Inserta en synced_items un batch de rows ya armados.
+ * Cada `row` = { ml_item_id, variation_id, item_data }.
+ */
+async function insertSyncedItems(accountId, jobId, rows) {
+    if (!rows.length) return;
+    const placeholders = [];
+    const values = [];
+    let p = 1;
+    for (const r of rows) {
+        placeholders.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++})`);
+        values.push(accountId, jobId, r.ml_item_id, r.variation_id, JSON.stringify(r.item_data));
+    }
+    await query(
+        `INSERT INTO synced_items (account_id, job_id, ml_item_id, variation_id, item_data)
+         VALUES ${placeholders.join(',')}`,
+        values
+    );
+}
+
+/**
+ * Convierte una página de items ML en rows de synced_items (padres + variantes).
+ */
+function expandItemsToRows(items) {
+    const rows = [];
+    for (const item of items) {
+        const variations = Array.isArray(item.variations) ? item.variations : [];
+        const hasVars = variations.length > 0;
+        // Padre / item simple.
+        rows.push({
+            ml_item_id:   String(item.id),
+            variation_id: null,
+            item_data:    buildItemRow(item, null, hasVars),
+        });
+        // Variantes.
+        if (hasVars) {
+            for (const v of variations) {
+                if (!v || !v.id) continue;
+                rows.push({
+                    ml_item_id:   String(item.id),
+                    variation_id: Number(v.id),
+                    item_data:    buildItemRow(item, v, true),
+                });
+            }
+        }
+    }
+    return rows;
+}
+
+// ----------------------------------------------------------------------------
+// Procesamiento de un job de sync
+// ----------------------------------------------------------------------------
+
+/**
+ * ¿El job sigue vivo? (no fue cancelado mientras procesábamos)
+ */
+async function jobIsActive(jobId) {
+    const r = await query(`SELECT status FROM jobs WHERE id = $1`, [jobId]);
+    return r.rowCount > 0 && r.rows[0].status === 'running';
+}
+
+/**
+ * Procesa un job de tipo sync_full / sync_incremental.
+ */
+async function processSyncJob(job) {
+    // 1) Cargar la cuenta.
+    const accR = await query(`SELECT * FROM accounts WHERE id = $1`, [job.account_id]);
+    if (!accR.rowCount) throw new Error('cuenta no encontrada');
+    const account = accR.rows[0];
+    if (account.revoked_at) throw new Error('cuenta revocada');
+
+    // 2) Token de ML.
+    const token = await getValidAccessToken(account);
+
+    // 3) Primera búsqueda para conocer el total.
+    const first = await mlSearchItems(account, token, 0, SYNC_CHUNK);
+    const total = first.total;
+    const stepsTotal = Math.max(1, Math.ceil(total / SYNC_CHUNK));
+    await query(
+        `UPDATE jobs SET steps_total = $2, steps_done = 0,
+                         message = $3
+         WHERE id = $1`,
+        [job.id, stepsTotal, `Sincronizando ${total} publicaciones...`]
+    );
+
+    // 4) Procesar la primera página (ya la tenemos) y después el resto.
+    let processed = 0;
+    let stepsDone = 0;
+
+    async function handlePage(ids) {
+        if (!ids.length) return;
+        // Multi-get en chunks de ML_BATCH_SIZE.
+        const allItems = [];
+        for (let i = 0; i < ids.length; i += ML_BATCH_SIZE) {
+            const chunk = ids.slice(i, i + ML_BATCH_SIZE);
+            const items = await mlGetItems(account, token, chunk);
+            allItems.push(...items);
+        }
+        const rows = expandItemsToRows(allItems);
+        await insertSyncedItems(account.id, job.id, rows);
+        processed += allItems.length;
+        stepsDone++;
+        await query(
+            `UPDATE jobs SET steps_done = $2,
+                             message = $3,
+                             last_seen_at = NOW()
+             WHERE id = $1`,
+            [job.id, stepsDone, `Sincronizadas ${processed} de ${total}...`]
+        );
+    }
+
+    await handlePage(first.ids);
+
+    // 5) Resto de las páginas.
+    for (let offset = SYNC_CHUNK; offset < total; offset += SYNC_CHUNK) {
+        if (!(await jobIsActive(job.id))) {
+            console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
+            return; // el status ya quedó en cancelled
+        }
+        const page = await mlSearchItems(account, token, offset, SYNC_CHUNK);
+        await handlePage(page.ids);
+    }
+
+    // 6) Done.
+    await query(
+        `UPDATE jobs SET status = 'done', finished_at = NOW(),
+                         result = $2,
+                         message = $3
+         WHERE id = $1 AND status = 'running'`,
+        [job.id,
+         JSON.stringify({ items_synced: processed, total }),
+         `Sync completo: ${processed} publicaciones.`]
+    );
+    console.log(`[worker] job ${job.public_id} done — ${processed} items`);
+}
+
+// ----------------------------------------------------------------------------
+// Loop principal
+// ----------------------------------------------------------------------------
+
+/**
+ * Toma un job pending procesable. Lock atómico para no doble-procesar.
+ * Solo tipos sync_* — push/auto_link los maneja el plugin (modelo A).
+ */
+async function claimJob() {
+    const r = await query(
+        `UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, NOW())
+         WHERE id = (
+            SELECT id FROM jobs
+            WHERE status = 'pending'
+              AND type IN ('sync_full', 'sync_incremental')
+            ORDER BY created_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+         )
+         RETURNING id, public_id, account_id, type, input`
+    );
+    return r.rowCount ? r.rows[0] : null;
+}
+
+async function tick() {
+    if (_busy) return;
+    _busy = true;
+    try {
+        const job = await claimJob();
+        if (!job) return;
+        console.log(`[worker] tomando job ${job.public_id} (${job.type})`);
+        try {
+            await processSyncJob(job);
+        } catch (err) {
+            console.error(`[worker] job ${job.public_id} falló:`, err.message);
+            await query(
+                `UPDATE jobs SET status = 'failed', finished_at = NOW(),
+                                 message = $2
+                 WHERE id = $1 AND status = 'running'`,
+                [job.id, 'Error: ' + err.message]
+            );
+        }
+    } catch (err) {
+        console.error('[worker] tick error:', err.message);
+    } finally {
+        _busy = false;
+    }
+}
+
+/**
+ * Arranca el loop del worker. Llamado una vez desde server.js.
+ */
+export function startWorker() {
+    if (!WORKER_ENABLED) {
+        console.log('[worker] deshabilitado (WFML_WORKER_ENABLED=0)');
+        return;
+    }
+    console.log(`[worker] arrancando — intervalo ${WORKER_INTERVAL}ms, chunk ${SYNC_CHUNK}`);
+    setInterval(() => { tick().catch((e) => console.error('[worker] tick uncaught:', e)); }, WORKER_INTERVAL);
+}

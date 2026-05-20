@@ -4,9 +4,9 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
-# Copiar fuentes — agregamos los módulos nuevos del Sprint 1 (db, auth, routes-v1)
-# y el script de migraciones.
-COPY server.js db.js auth.js routes-v1.js migrate.js ./
+# Copiar fuentes — módulos del Sprint 1 (db, auth, routes-v1, migrate) +
+# Sprint 2 (ml-api, worker).
+COPY server.js db.js auth.js routes-v1.js migrate.js ml-api.js worker.js ./
 COPY db ./db
 COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh

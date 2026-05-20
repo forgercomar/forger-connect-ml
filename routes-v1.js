@@ -309,7 +309,34 @@ export function mountV1(app, opts = {}) {
             return res.status(400).json({ ok: false, error: 'bad_type', message: `type debe ser uno de: ${[...VALID_JOB_TYPES].join(', ')}` });
         }
         const params = body.params && typeof body.params === 'object' ? body.params : {};
+        const jobPublic = generatePublicId('job');
 
+        // Los jobs sync_* NO pre-crean steps: el worker del central los procesa
+        // descubriendo el total contra ML y paginando solo. Los jobs push /
+        // auto_link_sku sí pre-crean steps (modelo A: el plugin los ejecuta).
+        const isSyncJob = (type === 'sync_full' || type === 'sync_incremental');
+
+        if (isSyncJob) {
+            try {
+                await query(
+                    `INSERT INTO jobs (public_id, account_id, type, status, input, steps_total)
+                     VALUES ($1, $2, $3, 'pending', $4, 0)`,
+                    [jobPublic, req.account.id, type, JSON.stringify(params)]
+                );
+            } catch (err) {
+                console.error('[v1/jobs] create sync error:', err);
+                return res.status(500).json({ ok: false, error: 'db_error', message: err.message });
+            }
+            return res.json({
+                ok: true,
+                job_id: jobPublic,
+                type,
+                status: 'pending',
+                steps_total: 0, // el worker lo va a setear al descubrir el total
+            });
+        }
+
+        // Jobs con steps pre-calculados (push / auto_link_sku).
         let plan;
         try {
             plan = buildStepsForJob(type, params);
@@ -323,7 +350,6 @@ export function mountV1(app, opts = {}) {
             return res.status(400).json({ ok: false, error: 'empty_job', message: 'El job no tiene work — nada que procesar.' });
         }
 
-        const jobPublic = generatePublicId('job');
         try {
             await tx(async (client) => {
                 const ins = await client.query(
@@ -333,8 +359,6 @@ export function mountV1(app, opts = {}) {
                     [jobPublic, req.account.id, type, JSON.stringify(params), plan.totalCount]
                 );
                 const jobId = ins.rows[0].id;
-                // Bulk insert de steps. Para volumen 0..5000 está OK en una sola query.
-                // Construimos un VALUES dinámico parametrizado.
                 const values = [];
                 const placeholders = [];
                 let p = 1;
@@ -579,6 +603,70 @@ export function mountV1(app, opts = {}) {
                 message: updated.message,
             },
         });
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /v1/jobs/:job_id/results?offset=&limit=
+    // Devuelve los items que el worker sincronizó para este job, paginados.
+    // El plugin los baja en lotes y los aplica a su wf_ml_items local.
+    //
+    // Idempotente: no marca nada al leer. El plugin puede re-bajar sin riesgo
+    // (su upsert local es idempotente). Para liberar espacio, cuando el plugin
+    // termina de bajar todo llama a POST /v1/jobs/:id/ack.
+    //
+    // Respuesta:
+    //   { ok: true, items: [ <item_data>, ... ], total: N, offset, limit }
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/jobs/:job_id/results'), authAccount, async (req, res) => {
+        const j = await query(
+            `SELECT id FROM jobs WHERE public_id = $1 AND account_id = $2`,
+            [req.params.job_id, req.account.id]
+        );
+        if (!j.rowCount) return res.status(404).json({ ok: false, error: 'not_found' });
+        const jobId = j.rows[0].id;
+
+        const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+        const limit  = Math.max(1, Math.min(1000, parseInt(req.query.limit, 10) || 500));
+
+        const totalR = await query(
+            `SELECT COUNT(*) AS n FROM synced_items WHERE job_id = $1`,
+            [jobId]
+        );
+        const total = Number(totalR.rows[0].n);
+
+        const rowsR = await query(
+            `SELECT item_data FROM synced_items
+             WHERE job_id = $1
+             ORDER BY id ASC
+             LIMIT $2 OFFSET $3`,
+            [jobId, limit, offset]
+        );
+        return res.json({
+            ok: true,
+            items: rowsR.rows.map((r) => r.item_data),
+            total,
+            offset,
+            limit,
+        });
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /v1/jobs/:job_id/ack
+    // El plugin confirma que bajó y aplicó todos los resultados. Marcamos los
+    // synced_items como delivered para que el cron de retención los limpie.
+    // -------------------------------------------------------------------------
+    app.post(p('/v1/jobs/:job_id/ack'), authAccount, async (req, res) => {
+        const j = await query(
+            `SELECT id FROM jobs WHERE public_id = $1 AND account_id = $2`,
+            [req.params.job_id, req.account.id]
+        );
+        if (!j.rowCount) return res.status(404).json({ ok: false, error: 'not_found' });
+        const r = await query(
+            `UPDATE synced_items SET delivered_at = NOW()
+             WHERE job_id = $1 AND delivered_at IS NULL`,
+            [j.rows[0].id]
+        );
+        return res.json({ ok: true, marked: r.rowCount });
     });
 
     // -------------------------------------------------------------------------
