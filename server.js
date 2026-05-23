@@ -1,5 +1,5 @@
 /**
- * wooforger-connect-ml — Microservicio OAuth bridge para MercadoLibre.
+ * forger-connect-ml — Microservicio OAuth bridge para MercadoLibre.
  *
  * Stateless: no DB, no sesiones server-side. El "state" del flow OAuth se
  * codifica en URL (base64 del JSON) y se valida con HMAC en cada paso.
@@ -32,12 +32,12 @@
  *                          La auth domain NO importa al final del flow porque ML
  *                          devuelve el code a cualquier auth domain del mismo país.
  *                          Para multi-país, podemos derivarlo de site_id si querés.
- *   BASE_URL               (opcional) Default 'https://wooforger.dev'. Usado para
+ *   BASE_URL               (opcional) Default 'https://goforger.com'. Usado para
  *                          construir el callback URL. Tiene que coincidir con el
  *                          redirect URI configurado en developers.mercadolibre.com.
  *   PORT                   (opcional) Default 3000.
  *
- * @author WooForger.dev
+ * @author goforger.com
  */
 
 import express from 'express';
@@ -144,7 +144,7 @@ const ML_CLIENT_ID     = process.env.ML_CLIENT_ID || '';
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || '';
 const HUB_SECRET       = process.env.WFML_OAUTH_HUB_SECRET || '';
 const ML_AUTH_DOMAIN   = process.env.ML_AUTH_DOMAIN || 'https://auth.mercadolibre.com.ar';
-const BASE_URL         = (process.env.BASE_URL || 'https://wooforger.dev').replace(/\/$/, '');
+const BASE_URL         = (process.env.BASE_URL || 'https://goforger.com').replace(/\/$/, '');
 const CALLBACK_URL     = `${BASE_URL}/connect-ml/callback`;
 
 // Validar config al arrancar — fail-fast.
@@ -153,7 +153,7 @@ if (!ML_CLIENT_ID)     missing.push('ML_CLIENT_ID');
 if (!ML_CLIENT_SECRET) missing.push('ML_CLIENT_SECRET');
 if (!HUB_SECRET)       missing.push('WFML_OAUTH_HUB_SECRET');
 if (missing.length) {
-    console.error('[wooforger-connect-ml] FATAL: faltan env vars:', missing.join(', '));
+    console.error('[forger-connect-ml] FATAL: faltan env vars:', missing.join(', '));
     process.exit(1);
 }
 
@@ -225,7 +225,7 @@ function isValidReturnTo(url) {
 /** Render simple HTML para páginas de error / fallback. */
 function htmlPage(title, body) {
     return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
-<title>${title} · WooForger</title>
+<title>${title} · Forger</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #1f2937; padding: 40px 20px; line-height: 1.55; }
@@ -238,7 +238,7 @@ function htmlPage(title, body) {
 </style>
 </head><body>
 <div class="wrap">${body}</div>
-<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:30px;">wooforger-connect-ml · stateless OAuth bridge</p>
+<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:30px;">forger-connect-ml · stateless OAuth bridge</p>
 </body></html>`;
 }
 
@@ -276,7 +276,7 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
     `;
 
     return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
-<title>Confirmá tu cuenta · WooForger</title>
+<title>Confirmá tu cuenta · Forger</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   * { box-sizing: border-box; }
@@ -347,8 +347,8 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
             </div>
             <div class="center">
                 <div class="halo" aria-hidden="true"></div>
-                <div class="ring is-center"><img src="https://wooforger.dev/wooforger-logo.png" alt="WooForger" onerror="this.style.display='none'" /></div>
-                <span class="label is-center"><strong>WooForger</strong><br><span>Capa de integración</span></span>
+                <div class="ring is-center"><img src="https://goforger.com/forger-logo.png" alt="Forger" onerror="this.style.display='none'" /></div>
+                <span class="label is-center"><strong>Forger</strong><br><span>Capa de integración</span></span>
             </div>
             <div class="connector" aria-hidden="true">
                 <span class="line"></span><span class="dot"></span><span class="dot d2"></span><span class="dot d3"></span>
@@ -388,7 +388,7 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
         <p class="hint">Si esta no es la cuenta correcta: cancelá, cerrá sesión en mercadolibre.com.ar/argentina/menu/cuenta o cambiá de cuenta en el browser, y volvé a iniciar la conexión desde tu sitio.</p>
     </div>
 </div>
-<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:24px;">wooforger-connect-ml · OAuth bridge</p>
+<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:24px;">forger-connect-ml · OAuth bridge</p>
 </body></html>`;
 }
 
@@ -681,7 +681,7 @@ app.post(['/connect-ml/finish', '/finish'], (req, res) => {
 
     res.type('html').send(htmlPage('Conectando...', `
         <h1 class="ok">✓ Listo, conectando tu cuenta...</h1>
-        <p>Volviendo a tu panel WooForger con las credenciales validadas.</p>
+        <p>Volviendo a tu panel Forger con las credenciales validadas.</p>
         <p style="margin-top:20px;font-size:12px;color:#9ca3af;">Si no se redirige automáticamente, <a href="${escapeHtml(finalUrl.toString())}">hacé click acá</a>.</p>
         <script>setTimeout(function(){ window.location.href = ${JSON.stringify(finalUrl.toString())}; }, 1000);</script>
     `));
@@ -876,11 +876,11 @@ app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
 // GET / — pequeña landing informativa
 // ============================================================================
 app.get('/', (req, res) => {
-    res.type('html').send(htmlPage('WooForger Connect ML',
-        `<h1>WooForger · Connect MercadoLibre</h1>
-        <p>Microservicio OAuth bridge para clientes WooForger MercadoLibre.</p>
-        <p>Si llegaste acá por error: este endpoint solo lo usan los plugins WooForger instalados en tu WordPress.</p>
-        <p><a href="https://wooforger.dev">wooforger.dev</a></p>`
+    res.type('html').send(htmlPage('Forger Connect ML',
+        `<h1>Forger · Connect MercadoLibre</h1>
+        <p>Microservicio OAuth bridge para clientes Forger MercadoLibre.</p>
+        <p>Si llegaste acá por error: este endpoint solo lo usan los plugins Forger instalados en tu WordPress.</p>
+        <p><a href="https://goforger.com">goforger.com</a></p>`
     ));
 });
 
@@ -901,9 +901,9 @@ function escapeHtml(s) {
 }
 
 app.listen(PORT, () => {
-    console.log(`[wooforger-connect-ml] listening on :${PORT}`);
-    console.log(`[wooforger-connect-ml] BASE_URL = ${BASE_URL}`);
-    console.log(`[wooforger-connect-ml] CALLBACK_URL = ${CALLBACK_URL}`);
+    console.log(`[forger-connect-ml] listening on :${PORT}`);
+    console.log(`[forger-connect-ml] BASE_URL = ${BASE_URL}`);
+    console.log(`[forger-connect-ml] CALLBACK_URL = ${CALLBACK_URL}`);
     // Arranca el worker del Central Orchestrator (procesa jobs de sync).
     // Si la DB no está disponible, el worker logguea el error y reintenta
     // en el próximo tick — no tumba el proceso.

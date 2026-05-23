@@ -3,7 +3,7 @@
 --
 -- Este schema vive en wf-postgres (mismo Docker que el connect-ml).
 -- Provee la base para coordinar jobs de sync/push entre múltiples plugins
--- WordPress clientes y el motor central que vive en wooforger.dev.
+-- WordPress clientes y el motor central que vive en goforger.com.
 --
 -- Modelo conceptual:
 --

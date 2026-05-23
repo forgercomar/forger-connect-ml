@@ -181,7 +181,7 @@ export function mountV1(app, opts = {}) {
     }
     // Registramos cada ruta con DOS paths: el "limpio" /v1/* y el prefijado
     // /connect-ml/v1/*. Esto es por el reverse proxy de EasyPanel: el dominio
-    // wooforger.dev sirve a comingsoon en la raíz, y solo enruta /connect-ml/*
+    // goforger.com sirve a comingsoon en la raíz, y solo enruta /connect-ml/*
     // hacia este container. Con ambas formas registradas, no importa si el
     // proxy strippea o conserva el prefijo: la ruta siempre matchea.
     const p = (path) => [path, '/connect-ml' + path];

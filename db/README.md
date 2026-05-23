@@ -1,4 +1,4 @@
-# wooforger-connect-ml — DB
+# forger-connect-ml — DB
 
 Schema Postgres del Central Orchestrator. Vive en el container `wf-postgres`.
 

@@ -1,6 +1,6 @@
-# wooforger-connect-ml
+# forger-connect-ml
 
-Microservicio OAuth bridge entre los plugins WooForger MercadoLibre y la
+Microservicio OAuth bridge entre los plugins Forger MercadoLibre y la
 API de ML. Stateless, deployable en cualquier proveedor que soporte Node.js.
 
 ## Qué hace
