@@ -4,9 +4,12 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
-# Copiar fuentes — módulos del Sprint 1 (db, auth, routes-v1, migrate) +
-# Sprint 2 (ml-api, worker) + Sprint 3 (scheduler).
-COPY server.js db.js auth.js routes-v1.js migrate.js ml-api.js worker.js scheduler.js ./
+# Copiar fuentes — TODOS los .js de la raíz (incluye server, db, auth, routes-v1,
+# migrate, ml-api, worker, scheduler, rate-limit, y cualquier futuro). El listado
+# explícito anterior causó el bug 2026-05-25: agregamos rate-limit.js al repo y
+# al deployar el container arrancaba con ERR_MODULE_NOT_FOUND porque el Dockerfile
+# no lo conocía. El glob evita ese tipo de oversight a futuro.
+COPY *.js ./
 COPY db ./db
 COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh
