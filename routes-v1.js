@@ -179,12 +179,20 @@ export function mountV1(app, opts = {}) {
     if (!HUB_SECRET) {
         throw new Error('mountV1: hubSecret requerido');
     }
+    // Hardening #25 (2026-05-25): rate-limit por IP. Si el llamador no pasa
+    // limiters (compat con tests / standalone), no-op.
+    const rlGeneral   = opts.rlGeneral   || ((req, res, next) => next());
+    const rlHandshake = opts.rlHandshake || ((req, res, next) => next());
     // Registramos cada ruta con DOS paths: el "limpio" /v1/* y el prefijado
     // /connect-ml/v1/*. Esto es por el reverse proxy de EasyPanel: el dominio
     // goforger.com sirve a comingsoon en la raíz, y solo enruta /connect-ml/*
     // hacia este container. Con ambas formas registradas, no importa si el
     // proxy strippea o conserva el prefijo: la ruta siempre matchea.
     const p = (path) => [path, '/connect-ml' + path];
+
+    // Rate-limit general aplicado a TODOS los /v1/* — handshake suma su propio
+    // limiter más estricto encima (ambos deben pasar).
+    app.use(['/v1', '/connect-ml/v1'], rlGeneral);
 
     // -------------------------------------------------------------------------
     // POST /v1/handshake
@@ -203,7 +211,7 @@ export function mountV1(app, opts = {}) {
     // Idempotente sobre ml_user_id: si la cuenta ya existe, rota el secret y
     // actualiza site_url + refresh_token.
     // -------------------------------------------------------------------------
-    app.post(p('/v1/handshake'), async (req, res) => {
+    app.post(p('/v1/handshake'), rlHandshake, async (req, res) => {
         const body = req.body || {};
         const sigGiven = String(body.handshake_sig || '');
         if (!sigGiven) {

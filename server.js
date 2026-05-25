@@ -49,6 +49,7 @@ import { mountV1 } from './routes-v1.js';
 import { ping as dbPing, query as dbQuery } from './db.js';
 import { startWorker } from './worker.js';
 import { startScheduler } from './scheduler.js';
+import { createRateLimiter } from './rate-limit.js';
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
 // para que el cliente pueda verificar qué build está corriendo sin acceso al
@@ -188,6 +189,26 @@ app.use(express.json({
         req.rawBody = buf && buf.length ? buf.toString('utf8') : '';
     },
 }));
+
+// ============================================================================
+// Rate limiters por bucket (hardening #25, 2026-05-25)
+// ============================================================================
+// Tiers calibrados para uso legítimo + headroom:
+//   - OAuth start/callback: rarísimo (1 por install). 30/15min/IP cubre soporte
+//     que prueba varias veces sin abrir las puertas a un atacante.
+//   - finish + refresh-token: el plugin refresca tokens proactivamente; 60/min
+//     es 1 por segundo, suficiente para uso normal y refresh batch.
+//   - /v1/handshake: 1 por install típicamente, pero un plugin recién instalado
+//     puede reintentar si falla. 20/15min/IP.
+//   - /v1/* general: el plugin hace polling de jobs (status, poll central).
+//     200/min/IP cubre polls cada ~300ms sin bloquear, deja techo razonable.
+//   - /webhooks (de ML) y /healthz/version: BYPASS — no son endpoints de
+//     cliente nuestro.
+const limitOauthStart    = createRateLimiter({ bucket: 'oauth-start',    windowMs: 15 * 60_000, max: 30,  label: '/connect-ml start' });
+const limitOauthCallback = createRateLimiter({ bucket: 'oauth-cb',       windowMs: 15 * 60_000, max: 30,  label: '/connect-ml/callback' });
+const limitFinishRefresh = createRateLimiter({ bucket: 'finish-refresh', windowMs: 60_000,      max: 60,  label: '/connect-ml/finish + /refresh-token' });
+const limitV1Handshake = createRateLimiter({ bucket: 'v1-handshake', windowMs: 15 * 60_000, max: 20, label: '/v1/handshake' });
+const limitV1General   = createRateLimiter({ bucket: 'v1-general',   windowMs: 60_000,      max: 200, label: '/v1/*' });
 
 // ============================================================================
 // Helpers
@@ -506,7 +527,11 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
 // Endpoints /v1/* para que los plugins clientes orquesten jobs (sync, push, etc.)
 // vía el central. Auth con HMAC shared-secret por cuenta (ver routes-v1.js).
 // ============================================================================
-mountV1(app, { hubSecret: HUB_SECRET });
+mountV1(app, {
+    hubSecret: HUB_SECRET,
+    rlGeneral:   limitV1General,
+    rlHandshake: limitV1Handshake,
+});
 
 // ============================================================================
 // GET /healthz — liveness check para el reverse proxy.
@@ -562,7 +587,7 @@ app.get(['/mappings/count', '/connect-ml/mappings/count'], (req, res) => {
 //              <site>/wp-admin/admin-post.php?action=wfml_oauth_callback).
 //   nonce      anti-CSRF generado por el plugin del cliente.
 // ============================================================================
-app.get('/connect-ml', async (req, res) => {
+app.get('/connect-ml', limitOauthStart, async (req, res) => {
     const { site_url = '', return_to = '', nonce = '', ts = '', sig = '' } = req.query;
 
     if (!return_to || !isValidReturnTo(String(return_to))) {
@@ -647,7 +672,7 @@ app.get('/connect-ml', async (req, res) => {
 // 3. Pide /users/me para nickname + email + site_id.
 // 4. Arma payload, lo firma con HMAC, redirige al return_to del cliente.
 // ============================================================================
-app.get('/connect-ml/callback', async (req, res) => {
+app.get('/connect-ml/callback', limitOauthCallback, async (req, res) => {
     const { code, state, error, error_description } = req.query;
 
     if (error) {
@@ -772,7 +797,7 @@ app.get('/connect-ml/callback', async (req, res) => {
 //   - confirm: firma el payload con HUB_SECRET y redirige al return_to del plugin.
 //   - cancel:  redirige al return_to con ?wfml_cancel=1 (plugin muestra notice).
 // ============================================================================
-app.post(['/connect-ml/finish', '/finish'], (req, res) => {
+app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, (req, res) => {
     const payloadB64 = String((req.body && req.body.payload)    || '');
     const returnTo   = String((req.body && req.body.return_to)  || '');
     const nonce      = String((req.body && req.body.nonce)      || '');
@@ -864,7 +889,7 @@ app.post(['/connect-ml/finish', '/finish'], (req, res) => {
 //   { ok: true,  payload: <base64>, signature: <base64> }   — payload tiene los tokens nuevos
 //   { ok: false, error: <string> }
 // ============================================================================
-app.post(['/refresh-token', '/connect-ml/refresh-token'], async (req, res) => {
+app.post(['/refresh-token', '/connect-ml/refresh-token'], limitFinishRefresh, async (req, res) => {
     // IMPORTANTE: algunos reverse proxies interceptan cualquier 5xx upstream y
     // lo reemplazan por una pagina HTML de error generica, aplastando el body
     // JSON. Por eso este endpoint SIEMPRE responde 200 y el cliente discrimina
