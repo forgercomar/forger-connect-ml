@@ -209,6 +209,11 @@ const limitOauthCallback = createRateLimiter({ bucket: 'oauth-cb',       windowM
 const limitFinishRefresh = createRateLimiter({ bucket: 'finish-refresh', windowMs: 60_000,      max: 60,  label: '/connect-ml/finish + /refresh-token' });
 const limitV1Handshake = createRateLimiter({ bucket: 'v1-handshake', windowMs: 15 * 60_000, max: 20, label: '/v1/handshake' });
 const limitV1General   = createRateLimiter({ bucket: 'v1-general',   windowMs: 60_000,      max: 200, label: '/v1/*' });
+// Webhooks: ML legítimo manda decenas/segundo en picos, así que el limit por IP
+// tiene que ser alto. Pero cualquier IP puede llegar al endpoint público — sin
+// rate limit, un atacante puede inundar la DB. 600 req/min por IP es ~10/seg,
+// alcanza para ML real con margen, frena floods.
+const limitWebhooks      = createRateLimiter({ bucket: 'webhooks',       windowMs: 60_000,      max: 600, label: '/connect-ml/webhooks' });
 
 // ============================================================================
 // Helpers
@@ -988,20 +993,65 @@ app.post(['/refresh-token', '/connect-ml/refresh-token'], limitFinishRefresh, as
 const WEBHOOK_ITEM_TOPICS  = new Set(['items', 'items_prices']);
 const WEBHOOK_ORDER_TOPICS = new Set(['orders_v2', 'orders']);
 
-app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
+// Hardening #26 (2026-05-25): el endpoint /webhooks es necesariamente público
+// (ML manda POSTs desde sus servidores, sin auth header — ML no firma webhooks).
+// Defensa en capas:
+//   1. Rate limit por IP (limitWebhooks, ~10 req/s/IP). Frena floods.
+//   2. application_id DEBE matchear ML_CLIENT_ID. Filtra el grueso de los
+//      atacantes drive-by que no conocen nuestro client_id.
+//   3. user_id DEBE estar registrado en accounts. Si no, descarte temprano sin
+//      tocar la DB de eventos.
+//   4. Idempotencia por `_id` del webhook (ML lo manda como identificador único
+//      y reintenta el mismo _id si no respondemos 200). Cache en memoria TTL 1h
+//      para frenar duplicados sin pegarle a la DB.
+//   5. Logging mínimo (solo eventos relevantes: descartes con razón, encolados).
+//      Sin esto se llenaba el log con miles de líneas por minuto en producción.
+//
+// NO validamos IP origen porque ML no publica un allowlist estable y nuestro
+// trust-proxy + req.ip ya resuelve la IP real para el limiter.
+// ML_CLIENT_ID ya está definido arriba (línea ~144).
+const WEBHOOK_SEEN_TTL_MS = 60 * 60_000; // 1h
+const webhookSeen = new Map(); // _id (string) → expiresAt (ms)
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of webhookSeen.entries()) {
+        if (v < now) webhookSeen.delete(k);
+    }
+}, 5 * 60_000).unref();
+
+app.post(['/connect-ml/webhooks', '/webhooks'], limitWebhooks, (req, res) => {
     // 1. Responder 200 INMEDIATO. ML retry si > 1.5s o status != 200.
+    //    Respondemos 200 incluso a payloads inválidos: si devolvemos 4xx ML
+    //    retry infinitamente, lo cual no nos ayuda (los inválidos no van a
+    //    volver válidos).
     res.status(200).json({ ok: true });
 
     // 2. Procesar fire-and-forget.
     const body = req.body || {};
-    const topic    = String(body.topic    || '?');
-    const resource = String(body.resource || '?');
+    const topic    = String(body.topic    || '');
+    const resource = String(body.resource || '');
     const userId   = body.user_id ? String(body.user_id) : '';
-    console.log(`[webhook] topic=${topic} user=${userId} resource=${resource}`);
+    const appId    = body.application_id ? String(body.application_id) : '';
+    const wId      = body._id ? String(body._id) : '';
 
-    if (!userId) {
-        console.log('[webhook] payload sin user_id — descartado');
+    // Validación de shape mínima — ML siempre manda estos campos.
+    if (!topic || !resource || !userId) {
         return;
+    }
+
+    // Validación application_id: solo aceptamos webhooks dirigidos a NUESTRA app.
+    // Si ML_CLIENT_ID no está seteado, skip esta validación (dev/test).
+    if (ML_CLIENT_ID && appId && appId !== ML_CLIENT_ID) {
+        console.warn(`[webhook] application_id mismatch (got=${appId}, want=${ML_CLIENT_ID}) — descartado`);
+        return;
+    }
+
+    // Idempotencia: si ya procesamos este _id en la última hora, descartar.
+    if (wId && webhookSeen.has(wId)) {
+        return; // silent — es retry de ML, todo OK
+    }
+    if (wId) {
+        webhookSeen.set(wId, Date.now() + WEBHOOK_SEEN_TTL_MS);
     }
 
     const isItem  = WEBHOOK_ITEM_TOPICS.has(topic);
@@ -1021,7 +1071,6 @@ app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
         resourceId = m ? m[1] : '';
     }
     if (!resourceId) {
-        console.log(`[webhook] resource sin id parseable: ${resource}`);
         return;
     }
 
@@ -1033,7 +1082,8 @@ app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
                 [Number(userId)]
             );
             if (!acc.rowCount) {
-                console.log(`[webhook] sin cuenta registrada para user=${userId} — descartado`);
+                // user_id no está registrado en este central → atacante o cuenta
+                // de otro tenant. Descarte silencioso (log demasiado spammy).
                 return;
             }
             const accountId = acc.rows[0].id;
@@ -1043,17 +1093,15 @@ app.post(['/connect-ml/webhooks', '/webhooks'], (req, res) => {
                      VALUES ($1, $2, $3)`,
                     [accountId, resourceId, topic]
                 );
-                console.log(`[webhook] item encolado item=${resourceId} cuenta=${accountId}`);
             } else {
                 await dbQuery(
                     `INSERT INTO order_events (account_id, ml_order_id)
                      VALUES ($1, $2)`,
                     [accountId, resourceId]
                 );
-                console.log(`[webhook] orden encolada order=${resourceId} cuenta=${accountId}`);
             }
         } catch (e) {
-            console.error('[webhook] no se pudo encolar evento:', e.message);
+            console.error('[webhook] enqueue error:', e.message);
         }
     })();
 });
