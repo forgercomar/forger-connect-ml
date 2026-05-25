@@ -251,7 +251,10 @@ function verifyStartSignature({ site_url, return_to, nonce, ts, sig }) {
     const now = Math.floor(Date.now() / 1000);
     if (Math.abs(now - tsNum) > 300) return { ok: false, reason: 'ts_window' };
     const canon = `${site_url}|${return_to}|${nonce}|${ts}`;
-    const expected = crypto.createHmac('sha256', HUB_SECRET).update(canon).digest('base64');
+    // base64url (RFC 4648 §5) — match con el plugin. Base64 estándar mete
+    // '+' que viaja como ' ' en query string y rompe la comparación.
+    const expected = crypto.createHmac('sha256', HUB_SECRET).update(canon).digest('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     try {
         const a = Buffer.from(expected);
         const b = Buffer.from(String(sig));
