@@ -386,9 +386,19 @@ function htmlPage(title, body) {
  */
 function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
     const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
-    // Firma sobre el trío payload|return_to|nonce para evitar tampering del form.
+    // Hardening #27 (2026-05-25): TTL + jti en el formSig.
+    //   ts  → ventana de 15 min entre render del confirm y submit del finish.
+    //         Sin esto, alguien que captura el form (logs HTTP de proxy, history
+    //         de browser, screenshot) puede submitearlo en cualquier momento.
+    //   jti → nonce one-use. Sin esto, el mismo form sumiteado 2 veces persiste
+    //         la cuenta 2 veces (cada submit registra mapping + redirige al
+    //         plugin que valida nonce WP — pero el central podría duplicar.).
+    const ts  = Math.floor(Date.now() / 1000);
+    const jti = crypto.randomBytes(16).toString('hex');
+    // Firma sobre el sextuple payload|return_to|nonce|ts|jti para evitar
+    // tampering Y replay del form.
     const formSig = crypto.createHmac('sha256', HUB_SECRET)
-        .update(payloadB64 + '|' + returnTo + '|' + nonce)
+        .update(payloadB64 + '|' + returnTo + '|' + nonce + '|' + ts + '|' + jti)
         .digest('base64');
 
     const hasRefresh = !!payload.refresh_token;
@@ -515,6 +525,8 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
             <input type="hidden" name="payload" value="${escapeHtml(payloadB64)}" />
             <input type="hidden" name="return_to" value="${escapeHtml(returnTo)}" />
             <input type="hidden" name="nonce" value="${escapeHtml(nonce)}" />
+            <input type="hidden" name="ts" value="${ts}" />
+            <input type="hidden" name="jti" value="${jti}" />
             <input type="hidden" name="form_sig" value="${escapeHtml(formSig)}" />
             <button type="submit" name="decision" value="cancel" class="btn btn-secondary">Cancelar (usar otra cuenta)</button>
             <button type="submit" name="decision" value="confirm" class="btn btn-primary">Confirmar y conectar</button>
@@ -802,14 +814,16 @@ app.get('/connect-ml/callback', limitOauthCallback, async (req, res) => {
 //   - confirm: firma el payload con HUB_SECRET y redirige al return_to del plugin.
 //   - cancel:  redirige al return_to con ?wfml_cancel=1 (plugin muestra notice).
 // ============================================================================
-app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, (req, res) => {
+app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, async (req, res) => {
     const payloadB64 = String((req.body && req.body.payload)    || '');
     const returnTo   = String((req.body && req.body.return_to)  || '');
     const nonce      = String((req.body && req.body.nonce)      || '');
+    const ts         = String((req.body && req.body.ts)         || '');
+    const jti        = String((req.body && req.body.jti)        || '');
     const formSig    = String((req.body && req.body.form_sig)   || '');
     const decision   = String((req.body && req.body.decision)   || '');
 
-    if (!payloadB64 || !returnTo || !nonce || !formSig) {
+    if (!payloadB64 || !returnTo || !nonce || !formSig || !ts || !jti) {
         return res.status(400).type('html').send(htmlPage('Error',
             `<h1 class="err">⚠ Form incompleto</h1>
             <p>Faltan campos en el formulario de confirmación. Cerrá esta ventana y reintentá desde tu sitio.</p>`
@@ -821,9 +835,10 @@ app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, (req, res) => {
         ));
     }
 
-    // Validar firma del form (anti-tampering).
+    // Validar firma del form (anti-tampering). Cubre payload + return_to + nonce
+    // + ts + jti — cualquier mutación rompe la firma.
     const expectedSig = crypto.createHmac('sha256', HUB_SECRET)
-        .update(payloadB64 + '|' + returnTo + '|' + nonce)
+        .update(payloadB64 + '|' + returnTo + '|' + nonce + '|' + ts + '|' + jti)
         .digest('base64');
     const expectedBuf = Buffer.from(expectedSig);
     const receivedBuf = Buffer.from(formSig);
@@ -833,6 +848,31 @@ app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, (req, res) => {
             `<h1 class="err">⚠ Firma inválida</h1>
             <p>El formulario fue manipulado o el shared secret cambió. Reintentá desde tu sitio.</p>`
         ));
+    }
+
+    // Hardening #27 (2026-05-25): TTL del handoff. 15 min entre el render de la
+    // confirmación y el submit. El user tiene tiempo razonable para pensar; un
+    // form capturado expira y no se puede submitear más tarde.
+    const tsNum = parseInt(ts, 10);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > 15 * 60) {
+        return res.status(403).type('html').send(htmlPage('Expirado',
+            `<h1 class="err">⚠ Confirmación expirada</h1>
+            <p>Pasaron más de 15 minutos desde que abriste esta pantalla. Por seguridad, volvé al plugin y reintentá la conexión.</p>`
+        ));
+    }
+
+    // Hardening #27: jti one-use. Si el mismo form se submitea 2 veces (back del
+    // browser, doble click, replay del atacante), el segundo es rechazado.
+    // Solo lo consumimos si confirm (cancel no tiene side-effects que prevenir).
+    if (decision !== 'cancel') {
+        const jtiCheck = await checkAndConsumeNonce(jti, 'handoff');
+        if (!jtiCheck.ok) {
+            return res.status(409).type('html').send(htmlPage('Ya usado',
+                `<h1 class="err">⚠ Confirmación ya procesada</h1>
+                <p>Esta confirmación ya se procesó antes. Si tu cuenta no quedó conectada, volvé al plugin y reintentá.</p>`
+            ));
+        }
     }
 
     // Decisión del usuario.
