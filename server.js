@@ -158,6 +158,27 @@ if (missing.length) {
     process.exit(1);
 }
 
+// Hardening #30 (2026-05-25): validar WFML_TOKEN_KEY al boot, no lazy. La key
+// se usa por auth.js (encryptToken / decryptToken) cada vez que persistimos o
+// leemos un refresh_token. Antes se validaba SOLO al primer call de encrypt —
+// el server arrancaba OK con la key faltante y fallaba minutos/horas después
+// en el primer handshake, complicando el debug ("¿por qué falla ahora?").
+const tokenKeyRaw = process.env.WFML_TOKEN_KEY || '';
+if (!tokenKeyRaw) {
+    console.error('[forger-connect-ml] FATAL: WFML_TOKEN_KEY no está definida en el entorno');
+    process.exit(1);
+}
+try {
+    const tk = Buffer.from(tokenKeyRaw, 'base64');
+    if (tk.length !== 32) {
+        console.error(`[forger-connect-ml] FATAL: WFML_TOKEN_KEY debe ser 32 bytes base64; actual: ${tk.length} bytes`);
+        process.exit(1);
+    }
+} catch (e) {
+    console.error('[forger-connect-ml] FATAL: WFML_TOKEN_KEY no es base64 válido');
+    process.exit(1);
+}
+
 const app = express();
 app.disable('x-powered-by');
 
@@ -189,6 +210,35 @@ app.use(express.json({
         req.rawBody = buf && buf.length ? buf.toString('utf8') : '';
     },
 }));
+
+// ============================================================================
+// Redact helper (hardening #30, 2026-05-25)
+// ============================================================================
+// Sanitiza objetos antes de loguearlos. Antes podíamos loguear directamente
+// `tokenData` de ML que en happy path contiene access_token + refresh_token, o
+// `req.body` del handoff con el payload b64 (decodificable). En error paths los
+// objetos llegan vacíos pero la sola posibilidad de que un futuro change los
+// loguee es suficiente: redactamos por defecto.
+//
+// Detecta claves típicas (token, secret, password, key) y reemplaza el valor.
+// Recursivo en objetos anidados. Limita profundidad a 6 niveles para evitar
+// loops en objetos cíclicos (rare pero defensivo).
+const REDACT_KEY_RE = /(^|_)(token|secret|password|key|auth|cookie|session)(_|$)/i;
+function redactSecrets(value, depth = 0) {
+    if (depth > 6) return '[depth limit]';
+    if (value == null) return value;
+    if (typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map((v) => redactSecrets(v, depth + 1));
+    const out = {};
+    for (const k of Object.keys(value)) {
+        if (REDACT_KEY_RE.test(k)) {
+            out[k] = '[REDACTED]';
+        } else {
+            out[k] = redactSecrets(value[k], depth + 1);
+        }
+    }
+    return out;
+}
 
 // ============================================================================
 // Rate limiters por bucket (hardening #25, 2026-05-25)
@@ -384,7 +434,7 @@ function htmlPage(title, body) {
  * Stateless: payload + return_to + nonce viajan como hidden fields firmados con
  * HMAC. El handler /connect-ml/finish valida la firma y decide qué hacer.
  */
-function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
+function confirmationPage({ payload, returnTo, nonce, siteUrl, alreadyConnected = false }) {
     const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
     // Hardening #27 (2026-05-25): TTL + jti en el formSig.
     //   ts  → ventana de 15 min entre render del confirm y submit del finish.
@@ -406,6 +456,14 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl }) {
     const expHours = payload.expires_in > 0 ? (payload.expires_in / 3600).toFixed(1) : '?';
 
     const warnings = [];
+    // UX #31: avisar si la cuenta ML ya está conectada a este site (handshake
+    // previo registrado en tabla `accounts`). El user pueden no darse cuenta
+    // (clickea "Conectar otra cuenta" pero el OAuth de ML lo dejó loggeado con
+    // la misma). El flow técnicamente sigue OK (es idempotente vía ml_user_id),
+    // pero queremos avisar para evitar la confusión "no me conectó la otra".
+    if (alreadyConnected) {
+        warnings.push('Esta cuenta de MercadoLibre <strong>ya está conectada en este sitio</strong>. Si querés agregar OTRA cuenta, primero deslogueate de MercadoLibre en otra pestaña y volvé a iniciar el flujo. Confirmar acá simplemente refresca los tokens de esta cuenta (no duplica nada).');
+    }
     if (!hasRefresh) {
         warnings.push('El payload <strong>no incluye refresh_token</strong>. Tu sitio no podrá renovar el token automáticamente cuando expire (~6h) y vas a tener que reconectar manualmente.');
     }
@@ -751,7 +809,7 @@ app.get('/connect-ml/callback', limitOauthCallback, async (req, res) => {
         });
         tokenData = await resp.json();
         if (!resp.ok) {
-            console.error('[oauth/token] error', resp.status, tokenData);
+            console.error('[oauth/token] error', resp.status, redactSecrets(tokenData));
             return res.status(502).type('html').send(htmlPage('Error',
                 `<h1 class="err">⚠ ML rechazó el code</h1>
                 <p><code>${escapeHtml((tokenData && tokenData.message) || resp.status)}</code></p>
@@ -759,7 +817,7 @@ app.get('/connect-ml/callback', limitOauthCallback, async (req, res) => {
             ));
         }
     } catch (e) {
-        console.error('[oauth/token] transport', e);
+        console.error('[oauth/token] transport', e.message);
         return res.status(502).type('html').send(htmlPage('Error',
             `<h1 class="err">⚠ No pudimos contactar a ML</h1>
             <p>Reintentá en unos minutos.</p>`
@@ -795,7 +853,22 @@ app.get('/connect-ml/callback', limitOauthCallback, async (req, res) => {
         ));
     }
 
-    // 4) En lugar de redirigir directo al plugin, mostramos pantalla de confirmación
+    // 4) Detectar si esta cuenta ML (ml_user_id + site_url) ya está conectada en
+    //    este sitio. Si sí, el confirmation muestra un warning explícito (#31).
+    let alreadyConnected = false;
+    try {
+        const exists = await dbQuery(
+            `SELECT 1 FROM accounts
+             WHERE ml_user_id = $1 AND site_url = $2 AND revoked_at IS NULL
+             LIMIT 1`,
+            [Number(payload.ml_user_id) || 0, String(site_url || '')]
+        );
+        alreadyConnected = exists.rowCount > 0;
+    } catch (e) {
+        console.warn('[callback] alreadyConnected check failed:', e.message);
+    }
+
+    // 5) En lugar de redirigir directo al plugin, mostramos pantalla de confirmación
     //    para que el usuario verifique que la cuenta sea la correcta antes de que
     //    sus tokens lleguen a su WordPress. El form postea a /connect-ml/finish con
     //    los datos firmados; ahí se decide redirect o cancel.
@@ -804,6 +877,7 @@ app.get('/connect-ml/callback', limitOauthCallback, async (req, res) => {
         returnTo: return_to,
         nonce: String(nonce),
         siteUrl: String(site_url || ''),
+        alreadyConnected,
     }));
 });
 
@@ -1041,7 +1115,9 @@ app.post(['/refresh-token', '/connect-ml/refresh-token'], limitFinishRefresh, as
         return res.json({ ok: false, error: 'transport: ' + e.message });
     }
     } catch (outer) {
-        console.error('[refresh-token] unhandled:', outer);
+        // Hardening #30: solo loguear el message, no el stack/object completo.
+        // El stack puede contener variables capturadas con tokens en clausura.
+        console.error('[refresh-token] unhandled:', outer.message);
         return res.json({ ok: false, error: 'internal: ' + outer.message });
     }
 });
