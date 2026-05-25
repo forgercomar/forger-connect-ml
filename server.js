@@ -889,13 +889,8 @@ app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, async (req, res)
         `));
     }
 
-    // Confirmar: re-firmamos el payload con el HMAC standard que espera el plugin
-    // y redirigimos. El plugin valida la firma y persiste.
+    // Confirmar: re-firmamos el payload con el HMAC standard que espera el plugin.
     const signature = hmac(payloadB64);
-    const finalUrl  = new URL(returnTo);
-    finalUrl.searchParams.set('nonce', nonce);
-    finalUrl.searchParams.set('payload', payloadB64);
-    finalUrl.searchParams.set('signature', signature);
 
     // Registrar mapping ml_user_id → site_url (WP root) para forward de webhooks.
     // El site_url debe incluir el path donde vive WP (puede estar en subcarpeta
@@ -910,12 +905,55 @@ app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, async (req, res)
         console.warn('[finish] register mapping failed:', e.message);
     }
 
-    res.type('html').send(htmlPage('Conectando...', `
-        <h1 class="ok">✓ Listo, conectando tu cuenta...</h1>
-        <p>Volviendo a tu panel Forger con las credenciales validadas.</p>
-        <p style="margin-top:20px;font-size:12px;color:#9ca3af;">Si no se redirige automáticamente, <a href="${escapeHtml(finalUrl.toString())}">hacé click acá</a>.</p>
-        <script>setTimeout(function(){ window.location.href = ${JSON.stringify(finalUrl.toString())}; }, 1000);</script>
-    `));
+    // Hardening #28 (2026-05-25): POST self-submit en vez de redirect GET. Antes
+    // los tokens viajaban en la query string del redirect (?payload=BASE64&signature=...)
+    // y quedaban en:
+    //   - logs del web server del cliente (access.log)
+    //   - history del browser
+    //   - Referer headers si la página del plugin redirigía
+    //   - bookmarks accidentales
+    // Con POST self-submit los tokens van en el body, no en la URL. La URL del
+    // browser termina siendo solo /wp-admin/admin-post.php (sin params sensibles).
+    // El form se auto-submitea con JS; si JS está deshabilitado hay un botón
+    // fallback manual.
+    const escAttr = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    // El returnTo viene como /wp-admin/admin-post.php?action=wfml_oauth_callback
+    // Strippeamos el query string para que la URL del browser no muestre nada
+    // sospechoso al inspeccionar; el `action` lo mandamos en el body (mismo
+    // dispatch en WordPress, sin duplicación visible).
+    const returnUrl = new URL(returnTo);
+    returnUrl.search = '';
+    const formAction = escAttr(returnUrl.toString());
+    res.type('html').send(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<title>Conectando · Forger</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #1f2937; padding: 40px 20px; line-height: 1.55; text-align: center; }
+  .wrap { max-width: 480px; margin: 80px auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); padding: 32px 40px; }
+  h1 { color: #16a34a; font-size: 22px; margin: 0 0 10px; }
+  .spin { display: inline-block; width: 28px; height: 28px; border: 3px solid #e5e7eb; border-top-color: #16a34a; border-radius: 50%; animation: s 0.8s linear infinite; margin: 18px 0; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .fallback-btn { display: inline-block; margin-top: 14px; padding: 10px 20px; background: #1a73e8; color: #fff; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }
+</style>
+</head><body>
+<div class="wrap">
+  <h1>✓ Listo, conectando tu cuenta...</h1>
+  <div class="spin"></div>
+  <p>Volviendo a tu panel Forger con las credenciales validadas.</p>
+  <form id="wfmlHandoff" method="POST" action="${formAction}">
+    <input type="hidden" name="action" value="wfml_oauth_callback">
+    <input type="hidden" name="nonce" value="${escAttr(nonce)}">
+    <input type="hidden" name="payload" value="${escAttr(payloadB64)}">
+    <input type="hidden" name="signature" value="${escAttr(signature)}">
+    <noscript>
+      <p style="margin-top:14px;font-size:13px;color:#6b7280;">JavaScript está desactivado.</p>
+      <button type="submit" class="fallback-btn">Continuar manualmente</button>
+    </noscript>
+  </form>
+  <script>setTimeout(function(){ document.getElementById('wfmlHandoff').submit(); }, 700);</script>
+</div>
+</body></html>`);
 });
 
 // ============================================================================
