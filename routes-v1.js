@@ -225,6 +225,34 @@ export function mountV1(app, opts = {}) {
             return res.status(403).json({ ok: false, error: 'bad_sig' });
         }
 
+        // Hardening #23 (2026-05-25): anti-replay. El body firmado DEBE incluir
+        // `ts` (unix seconds) dentro de window ±5min y `nonce` random one-use.
+        // Sin esto, capturar UNA vez el body firmado (logs de proxy, MITM
+        // histórico, backup) permitía rotar el shared_secret de la cuenta a
+        // perpetuidad → robo de cuenta.
+        const ts = Number(body.ts || 0);
+        const reqNonce = String(body.nonce || '').trim();
+        if (!ts || !reqNonce) {
+            return res.status(400).json({ ok: false, error: 'missing_anti_replay', message: 'Falta ts o nonce en el body firmado.' });
+        }
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (Math.abs(nowSec - ts) > 300) {
+            return res.status(400).json({ ok: false, error: 'ts_window', message: 'Timestamp fuera de la ventana ±5min.' });
+        }
+        try {
+            const dup = await query(
+                `INSERT INTO request_nonces (nonce, purpose, created_at) VALUES ($1, $2, $3)
+                 ON CONFLICT (nonce, purpose) DO NOTHING RETURNING nonce`,
+                [reqNonce, 'handshake', nowSec]
+            );
+            if (dup.rowCount === 0) {
+                return res.status(409).json({ ok: false, error: 'replay', message: 'Este request ya se procesó.' });
+            }
+        } catch (e) {
+            console.error('[handshake] nonce insert error:', e.message);
+            return res.status(500).json({ ok: false, error: 'nonce_check_failed' });
+        }
+
         const mlUserId = Number(body.ml_user_id);
         const siteUrl  = String(body.site_url || '').trim();
         const nick     = String(body.ml_nickname || '').trim();

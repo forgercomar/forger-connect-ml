@@ -222,6 +222,112 @@ function isValidReturnTo(url) {
     }
 }
 
+/**
+ * Hardening 2026-05-25: valida que return_to.origin === site_url.origin.
+ * Esto bloquea open-redirect attacks donde un atacante intenta robar tokens
+ * de la víctima redirigiendo a evil.com.
+ */
+function returnToMatchesSiteUrl(returnTo, siteUrl) {
+    try {
+        const r = new URL(returnTo);
+        const s = new URL(siteUrl);
+        return r.origin === s.origin;
+    } catch (e) { return false; }
+}
+
+/**
+ * Hardening 2026-05-25: verifica firma del query del plugin en /connect-ml start.
+ * El plugin firma sha = HMAC(HUB_SECRET, site_url|return_to|nonce|ts). El
+ * central re-calcula y compara timing-safe. Sin firma válida, el endpoint
+ * rechaza — bloquea generación de links arbitrarios por terceros.
+ *
+ * También chequea ts (timestamp unix seconds) dentro de window ±5min para
+ * prevenir replay de links viejos capturados de logs/history.
+ */
+function verifyStartSignature({ site_url, return_to, nonce, ts, sig }) {
+    if (!sig || !ts) return { ok: false, reason: 'missing_sig' };
+    const tsNum = parseInt(String(ts), 10);
+    if (!Number.isFinite(tsNum)) return { ok: false, reason: 'bad_ts' };
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - tsNum) > 300) return { ok: false, reason: 'ts_window' };
+    const canon = `${site_url}|${return_to}|${nonce}|${ts}`;
+    const expected = crypto.createHmac('sha256', HUB_SECRET).update(canon).digest('base64');
+    try {
+        const a = Buffer.from(expected);
+        const b = Buffer.from(String(sig));
+        if (a.length !== b.length) return { ok: false, reason: 'sig_len' };
+        if (!crypto.timingSafeEqual(a, b)) return { ok: false, reason: 'sig_mismatch' };
+        return { ok: true };
+    } catch (e) {
+        return { ok: false, reason: 'sig_compare_error' };
+    }
+}
+
+/**
+ * Hardening 2026-05-25: persistencia de oauth_states en Postgres.
+ * Antes el state viajaba codificado en base64 en la URL y volvía sin
+ * validación server-side ("no confiamos en el contenido del state cuando
+ * vuelve" — comment original). Ahora persistimos cada state emitido con
+ * TTL 10min + flag consumed para evitar reuso.
+ */
+async function createOAuthState({ site_url, return_to, nonce }) {
+    const stateId = crypto.randomBytes(32).toString('hex');
+    const now = Math.floor(Date.now() / 1000);
+    await dbQuery(
+        `INSERT INTO oauth_states (state_id, site_url, return_to, nonce, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [stateId, site_url, return_to, nonce, now]
+    );
+    return stateId;
+}
+
+async function consumeOAuthState(stateId) {
+    // SELECT + UPDATE en una sola query para race-safety: si dos requests
+    // intentan consumir el mismo state, solo una matchea consumed_at IS NULL.
+    const res = await dbQuery(
+        `UPDATE oauth_states
+            SET consumed_at = $2
+          WHERE state_id = $1
+            AND consumed_at IS NULL
+            AND created_at > $3
+        RETURNING site_url, return_to, nonce`,
+        [stateId, Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000) - 600]
+    );
+    return res.rowCount > 0 ? res.rows[0] : null;
+}
+
+/**
+ * Garbage-collect de oauth_states viejos. Corre al arrancar + cada 10 min.
+ */
+async function cleanupOAuthStates() {
+    const cutoff = Math.floor(Date.now() / 1000) - 3600; // 1h: borra incluso los consumed
+    try {
+        await dbQuery('DELETE FROM oauth_states WHERE created_at < $1', [cutoff]);
+        await dbQuery('DELETE FROM request_nonces WHERE created_at < $1', [cutoff]);
+    } catch (e) {
+        console.warn('[oauth] cleanup error:', e.message);
+    }
+}
+
+/**
+ * Anti-replay genérico: rechaza si el nonce ya se vio en window de 10min.
+ * Usado por: handshake (purpose='handshake'), oauth_start (purpose='oauth_start').
+ */
+async function checkAndConsumeNonce(nonce, purpose) {
+    const now = Math.floor(Date.now() / 1000);
+    try {
+        await dbQuery(
+            `INSERT INTO request_nonces (nonce, purpose, created_at) VALUES ($1, $2, $3)`,
+            [nonce, purpose, now]
+        );
+        return { ok: true };
+    } catch (e) {
+        // Duplicate key = replay.
+        if (e.code === '23505') return { ok: false, reason: 'replay' };
+        throw e;
+    }
+}
+
 /** Render simple HTML para páginas de error / fallback. */
 function htmlPage(title, body) {
     return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
@@ -453,13 +559,18 @@ app.get(['/mappings/count', '/connect-ml/mappings/count'], (req, res) => {
 //              <site>/wp-admin/admin-post.php?action=wfml_oauth_callback).
 //   nonce      anti-CSRF generado por el plugin del cliente.
 // ============================================================================
-app.get('/connect-ml', (req, res) => {
-    const { site_url = '', return_to = '', nonce = '' } = req.query;
+app.get('/connect-ml', async (req, res) => {
+    const { site_url = '', return_to = '', nonce = '', ts = '', sig = '' } = req.query;
 
     if (!return_to || !isValidReturnTo(String(return_to))) {
         return res.status(400).type('html').send(htmlPage('Error',
             `<h1 class="err">⚠ return_to inválido</h1>
             <p>El plugin del cliente debe enviar el parámetro <code>return_to</code> con una URL HTTP/HTTPS válida.</p>`
+        ));
+    }
+    if (!site_url || !isValidReturnTo(String(site_url))) {
+        return res.status(400).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ site_url inválido</h1>`
         ));
     }
     if (!nonce) {
@@ -469,21 +580,58 @@ app.get('/connect-ml', (req, res) => {
         ));
     }
 
-    // Codificar el state para que ML nos lo devuelva en el callback.
-    // No confiamos en el contenido del state cuando vuelve (ML solo lo retransmite),
-    // pero como solo lo usamos para reconstruir return_to/nonce, está OK.
-    const state = b64urlEncode({
-        s: String(site_url),
-        r: String(return_to),
-        n: String(nonce),
-        t: Math.floor(Date.now() / 1000),
-    });
+    // Hardening #22: return_to.origin DEBE matchear site_url.origin. Bloquea
+    // open-redirect attacks (atacante manda link a víctima con return_to=evil.com).
+    if (!returnToMatchesSiteUrl(String(return_to), String(site_url))) {
+        return res.status(400).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ Origen del return_to no coincide con el site_url</h1>
+            <p>Por seguridad, este flow requiere que <code>return_to</code> sea del mismo origin que <code>site_url</code>.</p>`
+        ));
+    }
+
+    // Hardening #22: verificar firma del plugin. Sin esto cualquiera puede
+    // generar links de OAuth.
+    const sigCheck = verifyStartSignature({ site_url, return_to, nonce, ts, sig });
+    if (!sigCheck.ok) {
+        return res.status(401).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ Firma inválida (${escapeHtml(sigCheck.reason)})</h1>
+            <p>El link de OAuth está corrupto o expirado. Volvé al plugin y reintentá la conexión.</p>`
+        ));
+    }
+
+    // Hardening #23: nonce one-use (anti-replay del start).
+    try {
+        const nonceCheck = await checkAndConsumeNonce(String(nonce), 'oauth_start');
+        if (!nonceCheck.ok) {
+            return res.status(409).type('html').send(htmlPage('Error',
+                `<h1 class="err">⚠ Link ya usado</h1>
+                <p>Este link de OAuth ya se usó antes. Volvé al plugin y generá uno nuevo.</p>`
+            ));
+        }
+    } catch (e) {
+        console.error('[connect-ml] nonce check error:', e.message);
+        return res.status(500).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Error interno</h1>`));
+    }
+
+    // Hardening #24: persistir state server-side. El state que va a ML es
+    // solo un ID random opaco — el server lookup el contexto en callback.
+    let stateId;
+    try {
+        stateId = await createOAuthState({
+            site_url: String(site_url),
+            return_to: String(return_to),
+            nonce: String(nonce),
+        });
+    } catch (e) {
+        console.error('[connect-ml] state create error:', e.message);
+        return res.status(500).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Error creando state</h1>`));
+    }
 
     const authUrl = new URL(ML_AUTH_DOMAIN + '/authorization');
     authUrl.searchParams.set('response_type', 'code');
     authUrl.searchParams.set('client_id', ML_CLIENT_ID);
     authUrl.searchParams.set('redirect_uri', CALLBACK_URL);
-    authUrl.searchParams.set('state', state);
+    authUrl.searchParams.set('state', stateId);
 
     res.redirect(302, authUrl.toString());
 });
@@ -513,19 +661,29 @@ app.get('/connect-ml/callback', async (req, res) => {
         ));
     }
 
-    // Decodificar state.
-    let stateObj;
-    try { stateObj = b64urlDecode(String(state)); }
-    catch (e) {
+    // Hardening #24: consumir el state server-side. Si no existe, ya se usó,
+    // o expiró → rechazar. Esto cierra el vector de "atacante precomputa
+    // /callback?code=...&state=..." sin pasar por /connect-ml.
+    let stateRow;
+    try {
+        stateRow = await consumeOAuthState(String(state));
+    } catch (e) {
+        console.error('[callback] state lookup error:', e.message);
+        return res.status(500).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Error verificando state</h1>`));
+    }
+    if (!stateRow) {
         return res.status(400).type('html').send(htmlPage('Error',
-            `<h1 class="err">⚠ State corrupto</h1>
-            <p>No pudimos decodificar el state. Cerrá esta ventana y reintentá desde el plugin.</p>`
+            `<h1 class="err">⚠ State inválido, expirado o ya usado</h1>
+            <p>El flow de conexión expiró o ya fue completado. Volvé al plugin y reintentá.</p>`
         ));
     }
-    const { r: return_to, n: nonce, s: site_url } = stateObj;
-    if (!return_to || !isValidReturnTo(return_to)) {
+    const return_to = stateRow.return_to;
+    const nonce     = stateRow.nonce;
+    const site_url  = stateRow.site_url;
+    // Defense in depth: re-validar return_to (por si alguien manipuló DB).
+    if (!return_to || !isValidReturnTo(return_to) || !returnToMatchesSiteUrl(return_to, site_url)) {
         return res.status(400).type('html').send(htmlPage('Error',
-            `<h1 class="err">⚠ return_to inválido en state</h1>`
+            `<h1 class="err">⚠ return_to inválido en state persistido</h1>`
         ));
     }
 
@@ -910,4 +1068,7 @@ app.listen(PORT, () => {
     startWorker();
     // Arranca el scheduler — encola jobs de sync automático periódicamente.
     startScheduler();
+    // Cleanup periódico de oauth_states + nonces vencidos. Cada 10 min.
+    cleanupOAuthStates().catch(() => {});
+    setInterval(() => { cleanupOAuthStates().catch(() => {}); }, 10 * 60 * 1000);
 });
