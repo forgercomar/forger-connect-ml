@@ -105,12 +105,34 @@ async function authAccount(req, res, next) {
         return res.status(401).json({ ok: false, error: 'bad_signature', message: verdict.reason });
     }
     req.account = acc;
-    // Bump last_seen para detección de actividad. Fire-and-forget.
-    query('SELECT bump_account_last_seen($1)', [acc.id]).catch((e) =>
-        console.warn('[v1] bump_account_last_seen failed:', e.message)
-    );
+    // Bump last_seen para detección de actividad. Fire-and-forget + throttle.
+    // Antes pegabamos a Postgres en CADA request /v1/* — con polling agresivo
+    // de jobs + multicuenta llegaba a cientos/min y Postgres lo logueaba como
+    // slow query. last_seen no necesita precisión sub-minuto, throttle 60s
+    // baja el tráfico ~100x sin perder utilidad informativa.
+    bumpAccountLastSeenThrottled(acc.id);
     next();
 }
+
+const _lastSeenCache = new Map(); // accountId → epoch ms del último bump
+const LAST_SEEN_THROTTLE_MS = 60_000; // 1 min entre bumps por cuenta
+function bumpAccountLastSeenThrottled(accountId) {
+    const now = Date.now();
+    const last = _lastSeenCache.get(accountId) || 0;
+    if (now - last < LAST_SEEN_THROTTLE_MS) return; // ya bumpeado recientemente
+    _lastSeenCache.set(accountId, now);
+    query('SELECT bump_account_last_seen($1)', [accountId]).catch((e) =>
+        console.warn('[v1] bump_account_last_seen failed:', e.message)
+    );
+}
+// GC del cache cada 10 min: entries más viejas que 1h se pueden borrar para
+// no acumular accountIds que ya no se usan. unref para no bloquear shutdown.
+setInterval(() => {
+    const cutoff = Date.now() - 60 * 60_000;
+    for (const [k, v] of _lastSeenCache.entries()) {
+        if (v < cutoff) _lastSeenCache.delete(k);
+    }
+}, 10 * 60_000).unref();
 
 /**
  * Construye el array de steps a insertar según el tipo de job + input.
