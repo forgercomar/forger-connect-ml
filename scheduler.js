@@ -64,6 +64,19 @@ const WEBHOOK_BATCH_INTERVAL = Math.max(15000, Number(process.env.WFML_WEBHOOK_B
 const ORDER_ENABLED  = process.env.WFML_ORDER_ENABLED !== '0';
 const ORDER_INTERVAL = Math.max(15000, Number(process.env.WFML_ORDER_INTERVAL) || 60000);
 
+// Janitor de jobs zombie: si el worker crashea a mitad de un job, queda en
+// status='running' para siempre porque claimJob() filtra status='pending'. Este
+// loop marca como 'failed' los jobs con last_seen_at viejo para que el plugin
+// que estaba polleando vea el error y reintente si corresponde.
+//
+// Threshold conservador (15 min): worker.js updatea last_seen_at en CADA step
+// (sync) o CADA PUT (push), o sea ~1-2s entre updates. 15 min sin update es
+// señal inequívoca de crash. NO se rescata a 'pending' para evitar doble
+// procesamiento (un PUT que ML ya recibió no debe re-PUT-earse).
+const ZOMBIE_ENABLED         = process.env.WFML_ZOMBIE_RECLAIM_ENABLED !== '0';
+const ZOMBIE_TIMEOUT_MIN     = Math.max(5, Number(process.env.WFML_ZOMBIE_TIMEOUT_MIN) || 15);
+const ZOMBIE_CHECK_INTERVAL  = Math.max(60000, Number(process.env.WFML_ZOMBIE_CHECK_INTERVAL) || 5 * 60_000);
+
 // Delay del primer chequeo — le da tiempo a la DB y al worker a estar listos
 // después de un deploy antes de empezar a encolar.
 const FIRST_RUN_DELAY = 30000;
@@ -72,6 +85,7 @@ const FIRST_RUN_DELAY = 30000;
 let _busy = false;
 let _webhookBusy = false;
 let _orderBusy = false;
+let _zombieBusy = false;
 
 /**
  * Busca las cuentas activas que necesitan un sync automático y encola un job
@@ -319,6 +333,56 @@ async function orderTick() {
 }
 
 // ----------------------------------------------------------------------------
+// Janitor de jobs zombie
+// ----------------------------------------------------------------------------
+
+/**
+ * Marca como 'failed' los jobs en status='running' cuyo last_seen_at quedó
+ * desfasado por más de ZOMBIE_TIMEOUT_MIN minutos. Esto pasa cuando el worker
+ * crashea/reinicia a mitad de un job: claimJob() solo toma 'pending', así que
+ * el job queda colgado y el plugin pollea infinitamente.
+ *
+ * Conservador a propósito:
+ *   - No revive a 'pending' (evita doble PUT a ML).
+ *   - Requiere last_seen_at IS NOT NULL para no matar jobs que recién empezaron
+ *     y todavía no escribieron el campo (los `claimJob` setea started_at pero
+ *     NOT last_seen_at hasta el primer step).
+ *   - Threshold ≥ 5min (clamp) — operación normal updatea last_seen_at cada PUT.
+ *
+ * @returns {Promise<number>} cantidad de jobs marcados.
+ */
+async function reclaimZombieJobs() {
+    const r = await query(
+        `UPDATE jobs
+         SET status = 'failed',
+             finished_at = NOW(),
+             message = COALESCE(NULLIF(message, ''), 'Worker timeout') || ' [reclaimed: sin actividad >${ZOMBIE_TIMEOUT_MIN}min]'
+         WHERE status = 'running'
+           AND last_seen_at IS NOT NULL
+           AND last_seen_at < NOW() - ($1 || ' minutes')::interval
+         RETURNING public_id, type`,
+        [String(ZOMBIE_TIMEOUT_MIN)]
+    );
+    if (r.rowCount) {
+        const ids = r.rows.map((j) => `${j.public_id}(${j.type})`).join(', ');
+        console.warn(`[scheduler] zombie reclaim — ${r.rowCount} job(s) marcados failed: ${ids}`);
+    }
+    return r.rowCount;
+}
+
+async function zombieTick() {
+    if (_zombieBusy) return;
+    _zombieBusy = true;
+    try {
+        await reclaimZombieJobs();
+    } catch (err) {
+        console.error('[scheduler] zombie tick error:', err.message);
+    } finally {
+        _zombieBusy = false;
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Arranque
 // ----------------------------------------------------------------------------
 
@@ -357,5 +421,16 @@ export function startScheduler() {
         }, FIRST_RUN_DELAY);
     } else {
         console.log('[scheduler] procesador de órdenes deshabilitado (WFML_ORDER_ENABLED=0)');
+    }
+
+    // Loop 4 — janitor de jobs zombie.
+    if (ZOMBIE_ENABLED) {
+        console.log(`[scheduler] zombie reclaim — chequeo cada ${Math.round(ZOMBIE_CHECK_INTERVAL / 1000)}s, timeout ${ZOMBIE_TIMEOUT_MIN}min`);
+        setTimeout(() => {
+            zombieTick().catch((e) => console.error('[scheduler] first zombie tick uncaught:', e));
+            setInterval(() => { zombieTick().catch((e) => console.error('[scheduler] zombie tick uncaught:', e)); }, ZOMBIE_CHECK_INTERVAL);
+        }, FIRST_RUN_DELAY);
+    } else {
+        console.log('[scheduler] zombie reclaim deshabilitado (WFML_ZOMBIE_RECLAIM_ENABLED=0)');
     }
 }
