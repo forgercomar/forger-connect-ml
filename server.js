@@ -148,6 +148,25 @@ const ML_AUTH_DOMAIN   = process.env.ML_AUTH_DOMAIN || 'https://auth.mercadolibr
 const BASE_URL         = (process.env.BASE_URL || 'https://goforger.com').replace(/\/$/, '');
 const CALLBACK_URL     = `${BASE_URL}/connect-ml/callback`;
 
+// ============================================================================
+// Config MercadoPago (OAuth de Checkout Pro). MP y ML son el MISMO proveedor
+// (Mercado): reusamos TODA la maquinaria de este bridge (state, HMAC, handoff,
+// pantalla de confirmación, rate limiters). Solo cambian el host de auth/token,
+// los scopes y que el token de MP ya trae user_id + public_key + live_mode.
+//
+// OPCIONAL / fail-soft: si MP_CLIENT_ID/SECRET no están seteadas, las rutas
+// /connect-mp quedan INERTES (responden "no configurado") pero el server arranca
+// igual — deployar esta branch NO rompe el servicio ML en producción hasta que
+// el dueño cargue las env de MP. HUB_SECRET es el MISMO (global, compartido).
+// ============================================================================
+const MP_CLIENT_ID     = process.env.MP_CLIENT_ID || '';
+const MP_CLIENT_SECRET = process.env.MP_CLIENT_SECRET || '';
+const MP_AUTH_DOMAIN   = (process.env.MP_AUTH_DOMAIN || 'https://auth.mercadopago.com').replace(/\/$/, '');
+const MP_TOKEN_URL     = process.env.MP_TOKEN_URL || 'https://api.mercadopago.com/oauth/token';
+const MP_SCOPES        = process.env.MP_SCOPES || 'read write offline_access';
+const MP_CALLBACK_URL  = `${BASE_URL}/connect-mp/callback`;
+const MP_ENABLED       = !!(MP_CLIENT_ID && MP_CLIENT_SECRET);
+
 // Validar config al arrancar — fail-fast.
 const missing = [];
 if (!ML_CLIENT_ID)     missing.push('ML_CLIENT_ID');
@@ -177,6 +196,13 @@ try {
 } catch (e) {
     console.error('[forger-connect-ml] FATAL: WFML_TOKEN_KEY no es base64 válido');
     process.exit(1);
+}
+
+// MercadoPago es opcional (no fail-fast): solo informamos el estado al arrancar.
+if (MP_ENABLED) {
+    console.log('[forger-connect-ml] MercadoPago OAuth HABILITADO (rutas /connect-mp).');
+} else {
+    console.warn('[forger-connect-ml] MercadoPago OAuth DESHABILITADO — faltan MP_CLIENT_ID/MP_CLIENT_SECRET. /connect-mp responderá "no configurado".');
 }
 
 const app = express();
@@ -264,6 +290,10 @@ const limitV1General   = createRateLimiter({ bucket: 'v1-general',   windowMs: 6
 // rate limit, un atacante puede inundar la DB. 600 req/min por IP es ~10/seg,
 // alcanza para ML real con margen, frena floods.
 const limitWebhooks      = createRateLimiter({ bucket: 'webhooks',       windowMs: 60_000,      max: 600, label: '/connect-ml/webhooks' });
+// MercadoPago — buckets propios para que un flood de MP no consuma el cupo de ML.
+const limitMpOauthStart    = createRateLimiter({ bucket: 'mp-oauth-start',    windowMs: 15 * 60_000, max: 30, label: '/connect-mp start' });
+const limitMpOauthCallback = createRateLimiter({ bucket: 'mp-oauth-cb',       windowMs: 15 * 60_000, max: 30, label: '/connect-mp/callback' });
+const limitMpFinishRefresh = createRateLimiter({ bucket: 'mp-finish-refresh', windowMs: 60_000,      max: 60, label: '/connect-mp/finish + /connect-mp/refresh-token' });
 
 // ============================================================================
 // Helpers
@@ -1118,6 +1148,407 @@ app.post(['/refresh-token', '/connect-ml/refresh-token'], limitFinishRefresh, as
         // Hardening #30: solo loguear el message, no el stack/object completo.
         // El stack puede contener variables capturadas con tokens en clausura.
         console.error('[refresh-token] unhandled:', outer.message);
+        return res.json({ ok: false, error: 'internal: ' + outer.message });
+    }
+});
+
+// ############################################################################
+// ###  MercadoPago (Checkout Pro) — OAuth un-click.                        ###
+// ###  ADITIVO: no toca ninguna ruta /connect-ml. Reusa los helpers        ###
+// ###  compartidos (createOAuthState/consumeOAuthState/checkAndConsumeNonce/###
+// ###  verifyStartSignature/returnToMatchesSiteUrl/isValidReturnTo/hmac/    ###
+// ###  htmlPage/escapeHtml). Solo cambia host/scopes/payload. El payload    ###
+// ###  de MP ya trae user_id + public_key + live_mode (sin /users/me).      ###
+// ###  Requisito EasyPanel: rutear goforger.com/connect-mp/* a este         ###
+// ###  contenedor SIN strippear el prefijo (igual que /connect-ml).         ###
+// ############################################################################
+
+/** Página de "MP no configurado" (faltan env MP_CLIENT_ID/SECRET). */
+function mpDisabledPage() {
+    return htmlPage('MercadoPago no configurado',
+        `<h1 class="err">⚠ MercadoPago no está configurado en este bridge</h1>
+        <p>Faltan las variables <code>MP_CLIENT_ID</code> / <code>MP_CLIENT_SECRET</code> en el servidor.</p>`);
+}
+
+/**
+ * Pantalla de confirmación pre-handoff para MercadoPago. Mismo esquema de firma
+ * que la de ML (payloadB64|return_to|nonce|ts|jti) pero con datos de MP
+ * (user_id, public_key, modo prod/sandbox). El form postea a /connect-mp/finish.
+ */
+function mpConfirmationPage({ payload, returnTo, nonce, siteUrl }) {
+    const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+    const ts  = Math.floor(Date.now() / 1000);
+    const jti = crypto.randomBytes(16).toString('hex');
+    const formSig = crypto.createHmac('sha256', HUB_SECRET)
+        .update(payloadB64 + '|' + returnTo + '|' + nonce + '|' + ts + '|' + jti)
+        .digest('base64');
+
+    const hasRefresh = !!payload.refresh_token;
+    const live  = !!payload.live_mode;
+    const modeLabel = live ? 'Producción · cobros reales' : 'Prueba · sandbox';
+    const pkShort = payload.public_key
+        ? escapeHtml(String(payload.public_key).slice(0, 12) + '…' + String(payload.public_key).slice(-6))
+        : '<em class="err">vacío</em>';
+    const expDays = payload.expires_in > 0 ? Math.round(payload.expires_in / 86400) : '?';
+
+    const warnings = [];
+    if (!hasRefresh) {
+        warnings.push('El payload <strong>no incluye refresh_token</strong>. Tu sitio no podrá renovar el token automáticamente cuando expire y vas a tener que reconectar la cuenta.');
+    }
+    if (!live) {
+        warnings.push('Esta es una credencial de <strong>prueba (sandbox)</strong>: no procesa cobros reales. Usá una cuenta de producción para cobrar de verdad.');
+    }
+    const warningsHtml = warnings.length === 0 ? '' : `
+        <div class="warnings"><strong>⚠ Atención antes de confirmar:</strong>
+        <ul>${warnings.map(w => `<li>${w}</li>`).join('')}</ul></div>`;
+
+    return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<title>Confirmá tu cuenta de MercadoPago · Forger</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(180deg,#f5f7fa 0%,#eef2f7 100%); color: #1f2937; padding: 20px; line-height: 1.55; min-height: 100vh; margin: 0; }
+  .wrap { max-width: 640px; margin: 40px auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.06); overflow: hidden; }
+  .hd { background: linear-gradient(180deg,#fafbfc 0%,#f3f4f6 100%); padding: 26px 32px 20px; border-bottom: 1px solid #e5e7eb; display:flex; align-items:center; gap:14px; }
+  .hd img { height: 34px; }
+  .hd h1 { margin: 0; font-size: 19px; color: #111827; }
+  .body { padding: 24px 32px 28px; }
+  .intro { color: #4b5563; font-size: 13.5px; margin: 0 0 18px; }
+  .site-pill { display: inline-block; background: #fff3ea; color: #c2410c; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .details { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 4px 0; margin-bottom: 16px; }
+  .row { display: flex; padding: 10px 16px; border-bottom: 1px solid #f3f4f6; }
+  .row:last-child { border-bottom: 0; }
+  .row .k { width: 150px; color: #6b7280; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; flex-shrink: 0; }
+  .row .v { flex: 1; font-size: 13px; color: #111827; }
+  .row .v code { background: #f3f4f6; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+  .row .v.big { font-weight: 700; font-size: 15px; }
+  .pill-mode { display:inline-block; padding:2px 10px; border-radius:999px; font-size:11px; font-weight:700; }
+  .pill-live { background:#dcfce7; color:#166534; } .pill-test { background:#fef3c7; color:#92400e; }
+  .ok { color: #047857; } .err { color: #b91c1c; }
+  .warnings { background: #fef3c7; border: 1px solid #fde68a; border-radius: 10px; padding: 12px 16px; margin-bottom: 18px; color: #78350f; font-size: 12.5px; }
+  .warnings strong { display: block; margin-bottom: 6px; }
+  .warnings ul { margin: 0; padding-left: 18px; } .warnings li { margin: 4px 0; }
+  .actions { display: flex; gap: 12px; justify-content: flex-end; }
+  .btn { padding: 10px 18px; border-radius: 8px; border: 1px solid; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; }
+  .btn-primary { background: #E55B0F; border-color: #E55B0F; color: #fff; }
+  .btn-primary:hover { background: #c44a08; }
+  .btn-secondary { background: #fff; border-color: #d1d5db; color: #374151; }
+  .hint { margin: 16px 0 0; font-size: 11.5px; color: #9ca3af; text-align: center; }
+  @media (max-width: 560px) { .row { flex-direction: column; gap: 4px; } .row .k { width: auto; } .actions { flex-direction: column-reverse; } .btn { width: 100%; } }
+</style>
+</head><body>
+<div class="wrap">
+    <div class="hd">
+        <img src="https://http2.mlstatic.com/frontend-assets/mp-web-navigation/ui-navigation/5.21.8/mercadopago/logo__large@2x.png" alt="MercadoPago" onerror="this.style.display='none'" />
+        <h1>Confirmá tu cuenta de MercadoPago</h1>
+    </div>
+    <div class="body">
+        <p class="intro">Vamos a enviar las credenciales de esta cuenta a tu sitio
+            <span class="site-pill">${escapeHtml(siteUrl || 'tu WordPress')}</span>.
+            Revisá que sea la cuenta correcta antes de confirmar.</p>
+        <div class="details">
+            <div class="row"><span class="k">user_id</span><span class="v big"><code>${escapeHtml(String(payload.user_id))}</code></span></div>
+            <div class="row"><span class="k">Modo</span><span class="v"><span class="pill-mode ${live ? 'pill-live' : 'pill-test'}">${modeLabel}</span></span></div>
+            <div class="row"><span class="k">public_key</span><span class="v"><code>${pkShort}</code></span></div>
+            <div class="row"><span class="k">access_token</span><span class="v"><span class="ok">✓ recibido (${String(payload.access_token).length} chars)</span> · válido ~${expDays} días</span></div>
+            <div class="row"><span class="k">refresh_token</span><span class="v">${hasRefresh ? `<span class="ok">✓ recibido (${String(payload.refresh_token).length} chars)</span>` : '<span class="err">✗ ausente — refresh automático no funcionará</span>'}</span></div>
+        </div>
+        ${warningsHtml}
+        <form method="POST" action="/connect-mp/finish" class="actions">
+            <input type="hidden" name="payload" value="${escapeHtml(payloadB64)}" />
+            <input type="hidden" name="return_to" value="${escapeHtml(returnTo)}" />
+            <input type="hidden" name="nonce" value="${escapeHtml(nonce)}" />
+            <input type="hidden" name="ts" value="${ts}" />
+            <input type="hidden" name="jti" value="${jti}" />
+            <input type="hidden" name="form_sig" value="${escapeHtml(formSig)}" />
+            <button type="submit" name="decision" value="cancel" class="btn btn-secondary">Cancelar</button>
+            <button type="submit" name="decision" value="confirm" class="btn btn-primary">Confirmar y conectar</button>
+        </form>
+        <p class="hint">Si no es la cuenta correcta: cancelá, cerrá sesión en mercadopago.com.ar y volvé a iniciar la conexión desde tu sitio.</p>
+    </div>
+</div>
+<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:24px;">forger-connect (Mercado) · OAuth bridge</p>
+</body></html>`;
+}
+
+// GET /connect-mp — inicio del flow OAuth de MercadoPago.
+app.get('/connect-mp', limitMpOauthStart, async (req, res) => {
+    if (!MP_ENABLED) return res.status(503).type('html').send(mpDisabledPage());
+    const { site_url = '', return_to = '', nonce = '', ts = '', sig = '' } = req.query;
+
+    if (!return_to || !isValidReturnTo(String(return_to))) {
+        return res.status(400).type('html').send(htmlPage('Error', `<h1 class="err">⚠ return_to inválido</h1>`));
+    }
+    if (!site_url || !isValidReturnTo(String(site_url))) {
+        return res.status(400).type('html').send(htmlPage('Error', `<h1 class="err">⚠ site_url inválido</h1>`));
+    }
+    if (!nonce) {
+        return res.status(400).type('html').send(htmlPage('Error', `<h1 class="err">⚠ nonce faltante</h1>`));
+    }
+    // Open-redirect guard (return_to.origin === site_url.origin).
+    if (!returnToMatchesSiteUrl(String(return_to), String(site_url))) {
+        return res.status(400).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Origen del return_to no coincide con el site_url</h1>`));
+    }
+    // Firma del plugin (mismo HUB_SECRET + ventana ±5min).
+    const sigCheck = verifyStartSignature({ site_url, return_to, nonce, ts, sig });
+    if (!sigCheck.ok) {
+        return res.status(401).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Firma inválida (${escapeHtml(sigCheck.reason)})</h1>`));
+    }
+    // Nonce one-use (purpose propio para no colisionar con el de ML).
+    try {
+        const nonceCheck = await checkAndConsumeNonce(String(nonce), 'oauth_start_mp');
+        if (!nonceCheck.ok) {
+            return res.status(409).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Link ya usado</h1>`));
+        }
+    } catch (e) {
+        console.error('[connect-mp] nonce check error:', e.message);
+        return res.status(500).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Error interno</h1>`));
+    }
+    // State opaco server-side.
+    let stateId;
+    try {
+        stateId = await createOAuthState({ site_url: String(site_url), return_to: String(return_to), nonce: String(nonce) });
+    } catch (e) {
+        console.error('[connect-mp] state create error:', e.message);
+        return res.status(500).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Error creando state</h1>`));
+    }
+    const authUrl = new URL(MP_AUTH_DOMAIN + '/authorization');
+    authUrl.searchParams.set('response_type', 'code');
+    authUrl.searchParams.set('client_id', MP_CLIENT_ID);
+    authUrl.searchParams.set('redirect_uri', MP_CALLBACK_URL);
+    authUrl.searchParams.set('state', stateId);
+    authUrl.searchParams.set('scope', MP_SCOPES);   // read write offline_access (ML no manda scope)
+    authUrl.searchParams.set('platform_id', 'mp');  // requerido por MP
+    res.redirect(302, authUrl.toString());
+});
+
+// GET /connect-mp/callback — vuelve de MercadoPago con ?code=&state=.
+app.get('/connect-mp/callback', limitMpOauthCallback, async (req, res) => {
+    if (!MP_ENABLED) return res.status(503).type('html').send(mpDisabledPage());
+    const { code, state, error, error_description } = req.query;
+
+    if (error) {
+        return res.status(400).type('html').send(htmlPage('Acceso denegado',
+            `<h1 class="err">⚠ ${escapeHtml(String(error))}</h1>
+            <p>${escapeHtml(String(error_description || 'MercadoPago rechazó la solicitud.'))}</p>`));
+    }
+    if (!code || !state) {
+        return res.status(400).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ Callback inválido</h1><p>Faltó <code>code</code> o <code>state</code>.</p>`));
+    }
+
+    let stateRow;
+    try {
+        stateRow = await consumeOAuthState(String(state));
+    } catch (e) {
+        console.error('[connect-mp/callback] state lookup error:', e.message);
+        return res.status(500).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Error verificando state</h1>`));
+    }
+    if (!stateRow) {
+        return res.status(400).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ State inválido, expirado o ya usado</h1>`));
+    }
+    const return_to = stateRow.return_to;
+    const nonce     = stateRow.nonce;
+    const site_url  = stateRow.site_url;
+    if (!return_to || !isValidReturnTo(return_to) || !returnToMatchesSiteUrl(return_to, site_url)) {
+        return res.status(400).type('html').send(htmlPage('Error', `<h1 class="err">⚠ return_to inválido en state persistido</h1>`));
+    }
+
+    // Intercambiar code → tokens. La respuesta de MP YA trae user_id + public_key
+    // + live_mode → no hace falta un /users/me como en ML.
+    let tokenData;
+    try {
+        const resp = await fetch(MP_TOKEN_URL, {
+            method: 'POST',
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                grant_type:    'authorization_code',
+                client_id:     MP_CLIENT_ID,
+                client_secret: MP_CLIENT_SECRET,
+                code:          String(code),
+                redirect_uri:  MP_CALLBACK_URL,
+            }).toString(),
+        });
+        tokenData = await resp.json();
+        if (!resp.ok) {
+            console.error('[mp oauth/token] error', resp.status, redactSecrets(tokenData));
+            return res.status(502).type('html').send(htmlPage('Error',
+                `<h1 class="err">⚠ MercadoPago rechazó el code</h1>
+                <p><code>${escapeHtml((tokenData && (tokenData.message || tokenData.error)) || resp.status)}</code></p>
+                <p>Normalmente el code ya se usó o expiró. Reintentá desde el plugin.</p>`));
+        }
+    } catch (e) {
+        console.error('[mp oauth/token] transport', e.message);
+        return res.status(502).type('html').send(htmlPage('Error', `<h1 class="err">⚠ No pudimos contactar a MercadoPago</h1>`));
+    }
+
+    const payload = {
+        user_id:       Number(tokenData.user_id || 0),
+        public_key:    String(tokenData.public_key || ''),
+        live_mode:     !!tokenData.live_mode,
+        access_token:  String(tokenData.access_token || ''),
+        refresh_token: String(tokenData.refresh_token || ''),
+        expires_in:    Number(tokenData.expires_in || 0),
+    };
+    if (!payload.user_id || !payload.access_token) {
+        return res.status(502).type('html').send(htmlPage('Error',
+            `<h1 class="err">⚠ Respuesta inesperada de MercadoPago</h1>
+            <p>Faltan campos críticos (user_id / access_token).</p>`));
+    }
+
+    res.type('html').send(mpConfirmationPage({
+        payload, returnTo: return_to, nonce: String(nonce), siteUrl: String(site_url || ''),
+    }));
+});
+
+// POST /connect-mp/finish — el usuario confirmó/canceló la pantalla pre-handoff.
+app.post('/connect-mp/finish', limitMpFinishRefresh, async (req, res) => {
+    if (!MP_ENABLED) return res.status(503).type('html').send(mpDisabledPage());
+    const payloadB64 = String((req.body && req.body.payload)    || '');
+    const returnTo   = String((req.body && req.body.return_to)  || '');
+    const nonce      = String((req.body && req.body.nonce)      || '');
+    const ts         = String((req.body && req.body.ts)         || '');
+    const jti        = String((req.body && req.body.jti)        || '');
+    const formSig    = String((req.body && req.body.form_sig)   || '');
+    const decision   = String((req.body && req.body.decision)   || '');
+
+    if (!payloadB64 || !returnTo || !nonce || !formSig || !ts || !jti) {
+        return res.status(400).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Form incompleto</h1>`));
+    }
+    if (!isValidReturnTo(returnTo)) {
+        return res.status(400).type('html').send(htmlPage('Error', `<h1 class="err">⚠ return_to inválido</h1>`));
+    }
+
+    const expectedSig = crypto.createHmac('sha256', HUB_SECRET)
+        .update(payloadB64 + '|' + returnTo + '|' + nonce + '|' + ts + '|' + jti)
+        .digest('base64');
+    const expectedBuf = Buffer.from(expectedSig);
+    const receivedBuf = Buffer.from(formSig);
+    if (expectedBuf.length !== receivedBuf.length || !crypto.timingSafeEqual(expectedBuf, receivedBuf)) {
+        return res.status(403).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Firma inválida</h1>`));
+    }
+
+    const tsNum = parseInt(ts, 10);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > 15 * 60) {
+        return res.status(403).type('html').send(htmlPage('Expirado', `<h1 class="err">⚠ Confirmación expirada</h1>`));
+    }
+
+    // jti one-use (purpose propio).
+    if (decision !== 'cancel') {
+        const jtiCheck = await checkAndConsumeNonce(jti, 'handoff_mp');
+        if (!jtiCheck.ok) {
+            return res.status(409).type('html').send(htmlPage('Ya usado', `<h1 class="err">⚠ Confirmación ya procesada</h1>`));
+        }
+    }
+
+    if (decision === 'cancel') {
+        const cancelUrl = new URL(returnTo);
+        cancelUrl.searchParams.set('nonce', nonce);
+        cancelUrl.searchParams.set('wfmp_cancel', '1');
+        return res.type('html').send(htmlPage('Cancelado', `
+            <h1>Conexión cancelada</h1>
+            <p>No se guardó ninguna cuenta de MercadoPago en tu sitio.</p>
+            <p style="margin-top:14px;"><a href="${escapeHtml(cancelUrl.toString())}">Volver al panel del plugin</a></p>
+            <script>setTimeout(function(){ window.location.href = ${JSON.stringify(cancelUrl.toString())}; }, 1500);</script>`));
+    }
+
+    // Confirmar: re-firmar el payload con el HMAC standard que valida el plugin.
+    // MP NO usa el forward de webhooks del central (los pagos los concilia el
+    // tracker/webhook del propio plugin) → no registramos mapping.
+    const signature = hmac(payloadB64);
+    const escAttr = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    const returnUrl = new URL(returnTo);
+    returnUrl.search = '';
+    const formAction = escAttr(returnUrl.toString());
+    res.type('html').send(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<title>Conectando · Forger</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #1f2937; padding: 40px 20px; line-height: 1.55; text-align: center; }
+  .wrap { max-width: 480px; margin: 80px auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); padding: 32px 40px; }
+  h1 { color: #16a34a; font-size: 22px; margin: 0 0 10px; }
+  .spin { display: inline-block; width: 28px; height: 28px; border: 3px solid #e5e7eb; border-top-color: #E55B0F; border-radius: 50%; animation: s 0.8s linear infinite; margin: 18px 0; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  .fallback-btn { display: inline-block; margin-top: 14px; padding: 10px 20px; background: #E55B0F; color: #fff; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }
+</style>
+</head><body>
+<div class="wrap">
+  <h1>✓ Listo, conectando tu cuenta...</h1>
+  <div class="spin"></div>
+  <p>Volviendo a tu panel Forger con las credenciales validadas.</p>
+  <form id="wfmpHandoff" method="POST" action="${formAction}">
+    <input type="hidden" name="action" value="wfmp_oauth_callback">
+    <input type="hidden" name="nonce" value="${escAttr(nonce)}">
+    <input type="hidden" name="payload" value="${escAttr(payloadB64)}">
+    <input type="hidden" name="signature" value="${escAttr(signature)}">
+    <noscript>
+      <p style="margin-top:14px;font-size:13px;color:#6b7280;">JavaScript está desactivado.</p>
+      <button type="submit" class="fallback-btn">Continuar manualmente</button>
+    </noscript>
+  </form>
+  <script>setTimeout(function(){ document.getElementById('wfmpHandoff').submit(); }, 700);</script>
+</div>
+</body></html>`);
+});
+
+// POST /connect-mp/refresh-token — refresh del access_token de MercadoPago.
+// El refresh_token de MP ROTA en cada uso → el plugin debe re-guardar el nuevo.
+app.post('/connect-mp/refresh-token', limitMpFinishRefresh, async (req, res) => {
+    try {
+        if (!MP_ENABLED) return res.json({ ok: false, error: 'mp_not_configured' });
+        const refresh_token = String((req.body && req.body.refresh_token) || '').trim();
+        const payload_sig   = String((req.body && req.body.payload_sig) || '').trim();
+        if (!refresh_token || !payload_sig) {
+            return res.status(400).json({ ok: false, error: 'missing refresh_token or payload_sig' });
+        }
+        const expectedSig = crypto.createHmac('sha256', HUB_SECRET).update(refresh_token).digest('base64');
+        const expectedBuf = Buffer.from(expectedSig);
+        const receivedBuf = Buffer.from(payload_sig);
+        if (expectedBuf.length !== receivedBuf.length || !crypto.timingSafeEqual(expectedBuf, receivedBuf)) {
+            return res.status(403).json({ ok: false, error: 'invalid signature' });
+        }
+        try {
+            const resp = await fetch(MP_TOKEN_URL, {
+                method: 'POST',
+                headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({
+                    grant_type:    'refresh_token',
+                    client_id:     MP_CLIENT_ID,
+                    client_secret: MP_CLIENT_SECRET,
+                    refresh_token: refresh_token,
+                }).toString(),
+            });
+            const raw = await resp.text();
+            let data;
+            try { data = JSON.parse(raw); } catch (_) { data = null; }
+            if (!resp.ok) {
+                return res.json({ ok: false, error: 'MP rejected refresh: ' + ((data && (data.message || data.error)) || ('HTTP ' + resp.status)), mp_status: resp.status });
+            }
+            if (!data) {
+                return res.json({ ok: false, error: 'MP responded non-JSON', mp_raw: raw.slice(0, 500) });
+            }
+            const out = {
+                access_token:  String(data.access_token || ''),
+                refresh_token: String(data.refresh_token || ''),
+                expires_in:    Number(data.expires_in || 0),
+                user_id:       Number(data.user_id || 0),
+                public_key:    String(data.public_key || ''),
+                live_mode:     !!data.live_mode,
+            };
+            if (!out.access_token) {
+                return res.json({ ok: false, error: 'MP response missing access_token' });
+            }
+            const payloadB64 = Buffer.from(JSON.stringify(out), 'utf8').toString('base64');
+            const signature  = crypto.createHmac('sha256', HUB_SECRET).update(payloadB64).digest('base64');
+            return res.json({ ok: true, payload: payloadB64, signature });
+        } catch (e) {
+            return res.json({ ok: false, error: 'transport: ' + e.message });
+        }
+    } catch (outer) {
+        console.error('[connect-mp/refresh-token] unhandled:', outer.message);
         return res.json({ ok: false, error: 'internal: ' + outer.message });
     }
 });
