@@ -149,7 +149,7 @@ const BASE_URL         = (process.env.BASE_URL || 'https://goforger.com').replac
 const CALLBACK_URL     = `${BASE_URL}/connect-ml/callback`;
 
 // ============================================================================
-// Config MercadoPago (OAuth de Checkout Pro). MP y ML son el MISMO proveedor
+// Config Mercado Pago (OAuth de Checkout Pro). MP y ML son el MISMO proveedor
 // (Mercado): reusamos TODA la maquinaria de este bridge (state, HMAC, handoff,
 // pantalla de confirmación, rate limiters). Solo cambian el host de auth/token,
 // los scopes y que el token de MP ya trae user_id + public_key + live_mode.
@@ -198,11 +198,11 @@ try {
     process.exit(1);
 }
 
-// MercadoPago es opcional (no fail-fast): solo informamos el estado al arrancar.
+// Mercado Pago es opcional (no fail-fast): solo informamos el estado al arrancar.
 if (MP_ENABLED) {
-    console.log('[forger-connect-ml] MercadoPago OAuth HABILITADO (rutas /connect-mp).');
+    console.log('[forger-connect-ml] Mercado Pago OAuth HABILITADO (rutas /connect-mp).');
 } else {
-    console.warn('[forger-connect-ml] MercadoPago OAuth DESHABILITADO — faltan MP_CLIENT_ID/MP_CLIENT_SECRET. /connect-mp responderá "no configurado".');
+    console.warn('[forger-connect-ml] Mercado Pago OAuth DESHABILITADO — faltan MP_CLIENT_ID/MP_CLIENT_SECRET. /connect-mp responderá "no configurado".');
 }
 
 const app = express();
@@ -290,7 +290,7 @@ const limitV1General   = createRateLimiter({ bucket: 'v1-general',   windowMs: 6
 // rate limit, un atacante puede inundar la DB. 600 req/min por IP es ~10/seg,
 // alcanza para ML real con margen, frena floods.
 const limitWebhooks      = createRateLimiter({ bucket: 'webhooks',       windowMs: 60_000,      max: 600, label: '/connect-ml/webhooks' });
-// MercadoPago — buckets propios para que un flood de MP no consuma el cupo de ML.
+// Mercado Pago — buckets propios para que un flood de MP no consuma el cupo de ML.
 const limitMpOauthStart    = createRateLimiter({ bucket: 'mp-oauth-start',    windowMs: 15 * 60_000, max: 30, label: '/connect-mp start' });
 const limitMpOauthCallback = createRateLimiter({ bucket: 'mp-oauth-cb',       windowMs: 15 * 60_000, max: 30, label: '/connect-mp/callback' });
 const limitMpFinishRefresh = createRateLimiter({ bucket: 'mp-finish-refresh', windowMs: 60_000,      max: 60, label: '/connect-mp/finish + /connect-mp/refresh-token' });
@@ -1153,7 +1153,7 @@ app.post(['/refresh-token', '/connect-ml/refresh-token'], limitFinishRefresh, as
 });
 
 // ############################################################################
-// ###  MercadoPago (Checkout Pro) — OAuth un-click.                        ###
+// ###  Mercado Pago (Checkout Pro) — OAuth un-click.                        ###
 // ###  ADITIVO: no toca ninguna ruta /connect-ml. Reusa los helpers        ###
 // ###  compartidos (createOAuthState/consumeOAuthState/checkAndConsumeNonce/###
 // ###  verifyStartSignature/returnToMatchesSiteUrl/isValidReturnTo/hmac/    ###
@@ -1165,13 +1165,13 @@ app.post(['/refresh-token', '/connect-ml/refresh-token'], limitFinishRefresh, as
 
 /** Página de "MP no configurado" (faltan env MP_CLIENT_ID/SECRET). */
 function mpDisabledPage() {
-    return htmlPage('MercadoPago no configurado',
-        `<h1 class="err">⚠ MercadoPago no está configurado en este bridge</h1>
+    return htmlPage('Mercado Pago no configurado',
+        `<h1 class="err">⚠ Mercado Pago no está configurado en este bridge</h1>
         <p>Faltan las variables <code>MP_CLIENT_ID</code> / <code>MP_CLIENT_SECRET</code> en el servidor.</p>`);
 }
 
 /**
- * Pantalla de confirmación pre-handoff para MercadoPago. Mismo esquema de firma
+ * Pantalla de confirmación pre-handoff para Mercado Pago. Mismo esquema de firma
  * que la de ML (payloadB64|return_to|nonce|ts|jti) pero con datos de MP
  * (user_id, public_key, modo prod/sandbox). El form postea a /connect-mp/finish.
  */
@@ -1203,7 +1203,7 @@ function mpConfirmationPage({ payload, returnTo, nonce, siteUrl }) {
         <ul>${warnings.map(w => `<li>${w}</li>`).join('')}</ul></div>`;
 
     return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
-<title>Confirmá tu cuenta de MercadoPago · Forger</title>
+<title>Confirmá tu cuenta de Mercado Pago · Forger</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   * { box-sizing: border-box; }
@@ -1239,8 +1239,8 @@ function mpConfirmationPage({ payload, returnTo, nonce, siteUrl }) {
 </head><body>
 <div class="wrap">
     <div class="hd">
-        <img src="https://http2.mlstatic.com/frontend-assets/mp-web-navigation/ui-navigation/5.21.8/mercadopago/logo__large@2x.png" alt="MercadoPago" onerror="this.style.display='none'" />
-        <h1>Confirmá tu cuenta de MercadoPago</h1>
+        <img src="https://http2.mlstatic.com/frontend-assets/mp-web-navigation/ui-navigation/5.21.8/mercadopago/logo__large@2x.png" alt="Mercado Pago" onerror="this.style.display='none'" />
+        <h1>Confirmá tu cuenta de Mercado Pago</h1>
     </div>
     <div class="body">
         <p class="intro">Vamos a enviar las credenciales de esta cuenta a tu sitio
@@ -1271,7 +1271,7 @@ function mpConfirmationPage({ payload, returnTo, nonce, siteUrl }) {
 </body></html>`;
 }
 
-// GET /connect-mp — inicio del flow OAuth de MercadoPago.
+// GET /connect-mp — inicio del flow OAuth de Mercado Pago.
 app.get('/connect-mp', limitMpOauthStart, async (req, res) => {
     if (!MP_ENABLED) return res.status(503).type('html').send(mpDisabledPage());
     const { site_url = '', return_to = '', nonce = '', ts = '', sig = '' } = req.query;
@@ -1322,7 +1322,7 @@ app.get('/connect-mp', limitMpOauthStart, async (req, res) => {
     res.redirect(302, authUrl.toString());
 });
 
-// GET /connect-mp/callback — vuelve de MercadoPago con ?code=&state=.
+// GET /connect-mp/callback — vuelve de Mercado Pago con ?code=&state=.
 app.get('/connect-mp/callback', limitMpOauthCallback, async (req, res) => {
     if (!MP_ENABLED) return res.status(503).type('html').send(mpDisabledPage());
     const { code, state, error, error_description } = req.query;
@@ -1330,7 +1330,7 @@ app.get('/connect-mp/callback', limitMpOauthCallback, async (req, res) => {
     if (error) {
         return res.status(400).type('html').send(htmlPage('Acceso denegado',
             `<h1 class="err">⚠ ${escapeHtml(String(error))}</h1>
-            <p>${escapeHtml(String(error_description || 'MercadoPago rechazó la solicitud.'))}</p>`));
+            <p>${escapeHtml(String(error_description || 'Mercado Pago rechazó la solicitud.'))}</p>`));
     }
     if (!code || !state) {
         return res.status(400).type('html').send(htmlPage('Error',
@@ -1374,13 +1374,13 @@ app.get('/connect-mp/callback', limitMpOauthCallback, async (req, res) => {
         if (!resp.ok) {
             console.error('[mp oauth/token] error', resp.status, redactSecrets(tokenData));
             return res.status(502).type('html').send(htmlPage('Error',
-                `<h1 class="err">⚠ MercadoPago rechazó el code</h1>
+                `<h1 class="err">⚠ Mercado Pago rechazó el code</h1>
                 <p><code>${escapeHtml((tokenData && (tokenData.message || tokenData.error)) || resp.status)}</code></p>
                 <p>Normalmente el code ya se usó o expiró. Reintentá desde el plugin.</p>`));
         }
     } catch (e) {
         console.error('[mp oauth/token] transport', e.message);
-        return res.status(502).type('html').send(htmlPage('Error', `<h1 class="err">⚠ No pudimos contactar a MercadoPago</h1>`));
+        return res.status(502).type('html').send(htmlPage('Error', `<h1 class="err">⚠ No pudimos contactar a Mercado Pago</h1>`));
     }
 
     // Enriquecer con /users/me — el plugin usa `nickname` como nombre de la cuenta.
@@ -1411,7 +1411,7 @@ app.get('/connect-mp/callback', limitMpOauthCallback, async (req, res) => {
     };
     if (!payload.user_id || !payload.access_token) {
         return res.status(502).type('html').send(htmlPage('Error',
-            `<h1 class="err">⚠ Respuesta inesperada de MercadoPago</h1>
+            `<h1 class="err">⚠ Respuesta inesperada de Mercado Pago</h1>
             <p>Faltan campos críticos (user_id / access_token).</p>`));
     }
 
@@ -1467,7 +1467,7 @@ app.post('/connect-mp/finish', limitMpFinishRefresh, async (req, res) => {
         cancelUrl.searchParams.set('wfmp_cancel', '1');
         return res.type('html').send(htmlPage('Cancelado', `
             <h1>Conexión cancelada</h1>
-            <p>No se guardó ninguna cuenta de MercadoPago en tu sitio.</p>
+            <p>No se guardó ninguna cuenta de Mercado Pago en tu sitio.</p>
             <p style="margin-top:14px;"><a href="${escapeHtml(cancelUrl.toString())}">Volver al panel del plugin</a></p>
             <script>setTimeout(function(){ window.location.href = ${JSON.stringify(cancelUrl.toString())}; }, 1500);</script>`));
     }
@@ -1512,7 +1512,7 @@ app.post('/connect-mp/finish', limitMpFinishRefresh, async (req, res) => {
 </body></html>`);
 });
 
-// POST /connect-mp/refresh-token — refresh del access_token de MercadoPago.
+// POST /connect-mp/refresh-token — refresh del access_token de Mercado Pago.
 // El refresh_token de MP ROTA en cada uso → el plugin debe re-guardar el nuevo.
 app.post('/connect-mp/refresh-token', limitMpFinishRefresh, async (req, res) => {
     try {
