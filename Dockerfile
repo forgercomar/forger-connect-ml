@@ -1,4 +1,7 @@
-FROM node:20-alpine AS base
+# Mirror público de AWS ECR del node:20-alpine oficial de Docker Hub. Evita el
+# "429 Too Many Requests / unauthenticated pull rate limit" de docker.io en cada
+# build de EasyPanel (no requiere auth y tiene límites mucho más altos).
+FROM public.ecr.aws/docker/library/node:20-alpine AS base
 WORKDIR /app
 
 COPY package.json ./
