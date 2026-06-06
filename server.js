@@ -1383,8 +1383,26 @@ app.get('/connect-mp/callback', limitMpOauthCallback, async (req, res) => {
         return res.status(502).type('html').send(htmlPage('Error', `<h1 class="err">⚠ No pudimos contactar a MercadoPago</h1>`));
     }
 
+    // Enriquecer con /users/me — el plugin usa `nickname` como nombre de la cuenta.
+    // No-fatal: si falla, seguimos con el payload del token (user_id ya viene ahí).
+    let mpUser = {};
+    try {
+        const r = await fetch('https://api.mercadopago.com/users/me', {
+            headers: { 'Authorization': 'Bearer ' + tokenData.access_token },
+        });
+        if (r.ok) mpUser = await r.json();
+    } catch (e) {
+        console.warn('[mp users/me] no se pudo enriquecer:', e.message);
+    }
+    const mpNickname = String(
+        mpUser.nickname ||
+        [mpUser.first_name, mpUser.last_name].filter(Boolean).join(' ') ||
+        ''
+    ).trim();
+
     const payload = {
-        user_id:       Number(tokenData.user_id || 0),
+        user_id:       Number(tokenData.user_id || mpUser.id || 0),
+        nickname:      mpNickname,
         public_key:    String(tokenData.public_key || ''),
         live_mode:     !!tokenData.live_mode,
         access_token:  String(tokenData.access_token || ''),
