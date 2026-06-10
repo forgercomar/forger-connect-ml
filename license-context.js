@@ -65,8 +65,13 @@ export function initLicenseContext(env = process.env) {
             `(LICENSE_ENFORCE solicitado: "${ctx.modeRequested}", se ignora hasta que haya pública.)`);
     } else {
         try {
-            // Soporta PEM directo o PEM con \n escapados en la env (común en dashboards).
-            const pem = pubRaw.includes('\\n') ? pubRaw.replace(/\\n/g, '\n') : pubRaw;
+            // Robusto contra cómo los paneles de envs guardan el PEM multilínea:
+            // comillas envolventes + '\n'/'\r\n' literales escapados + CR reales.
+            let pem = pubRaw;
+            if ((pem.startsWith('"') && pem.endsWith('"')) || (pem.startsWith("'") && pem.endsWith("'"))) {
+                pem = pem.slice(1, -1);
+            }
+            pem = pem.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\\r/g, '').replace(/\r/g, '');
             ctx.publicKey = createPublicKey(pem);
             ctx.mode = ctx.modeRequested;
             console.log(`[license] enforcement habilitado — modo "${ctx.mode}", gracia ${ctx.gracePeriodSec}s ` +
