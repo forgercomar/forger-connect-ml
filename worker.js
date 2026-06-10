@@ -36,6 +36,80 @@ const WORKER_ENABLED  = process.env.WFML_WORKER_ENABLED !== '0';
 const WORKER_INTERVAL = Math.max(2000, Number(process.env.WFML_WORKER_INTERVAL) || 5000);
 const SYNC_CHUNK      = Math.max(1, Math.min(50, Number(process.env.WFML_SYNC_CHUNK) || 50));
 
+// Enforcement de licencia (Fase 6). Lo inyecta server.js vía startWorker(); si no,
+// queda null → el worker no aplica ningún gate (comportamiento "off").
+let _license = null; // { getContext, isEnforcing, isLicenseActive }
+
+// Backoff en memoria para no re-claimear en loop un job de cuenta con licencia
+// vencida: tras saltearlo lo devolvemos a 'pending' y anotamos un "no antes de".
+// Sin esto, claimJob lo re-tomaría cada tick (~5s) y nunca avanzaría otros jobs.
+const LICENSE_SKIP_BACKOFF_MS = 5 * 60_000; // 5 min entre reintentos de un job vencido
+const _licenseSkipUntil = new Map(); // jobId → epoch ms hasta el que no re-procesar
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of _licenseSkipUntil.entries()) {
+        if (v < now) _licenseSkipUntil.delete(k);
+    }
+}, 10 * 60_000).unref();
+
+/**
+ * Gate de licencia para jobs del worker (CON gracia). Devuelve true si el job
+ * NO debe procesarse ahora: licencia vencida (account.license_exp <= now) Y fuera
+ * del período de gracia Y enforcement activo. La denylist (revoke explícito)
+ * también bloquea aunque license_exp no haya vencido. En "observe"/"off" => false
+ * (nunca bloquea). NO pierde el job: lo deja para más tarde (lo maneja el caller).
+ *
+ * @returns {{ blocked: boolean, reason?: string }}
+ */
+function licenseBlocksJob(account) {
+    if (!_license || !_license.isLicenseActive() || !_license.isEnforcing()) {
+        return { blocked: false };
+    }
+    const ctx = _license.getContext();
+
+    // Revoke explícito gana siempre (incluso sobre gracia).
+    if (account.license_id && ctx.denylist.has(String(account.license_id))) {
+        return { blocked: true, reason: 'revoked' };
+    }
+
+    const expMs = account.license_exp ? new Date(account.license_exp).getTime() : 0;
+    // Sin license_exp conocido: nunca presentó un token válido (o pre-Fase6).
+    // No bloqueamos por ausencia de datos — el gate del request (authAccount) ya
+    // cubre el handshake/jobs en vivo; acá solo cortamos vencimientos confirmados.
+    if (!expMs) return { blocked: false };
+
+    const now = Date.now();
+    if (expMs > now) return { blocked: false }; // licencia vigente
+
+    // Vencida → ¿dentro de gracia? (ancla = último token válido presentado).
+    const anchorMs = account.last_valid_license_token_at
+        ? new Date(account.last_valid_license_token_at).getTime()
+        : 0;
+    const inGrace = anchorMs > 0 && (now - anchorMs) <= ctx.gracePeriodSec * 1000;
+    if (inGrace) return { blocked: false };
+
+    return { blocked: true, reason: 'expired' };
+}
+
+/**
+ * Devuelve un job bloqueado por licencia a 'pending' (sin perderlo) y anota un
+ * backoff para no re-claimearlo en el próximo tick. El job correrá cuando la
+ * licencia se renueve (o aplique gracia) y pase el backoff.
+ */
+async function deferJobForLicense(job, reason) {
+    _licenseSkipUntil.set(String(job.id), Date.now() + LICENSE_SKIP_BACKOFF_MS);
+    try {
+        await query(
+            `UPDATE jobs SET status = 'pending', started_at = NULL,
+                             message = $2
+             WHERE id = $1 AND status = 'running'`,
+            [job.id, `En espera: licencia ${reason === 'revoked' ? 'revocada' : 'vencida'} (se reintenta al renovar).`]
+        );
+    } catch (e) {
+        console.warn('[worker] deferJobForLicense update failed:', e.message);
+    }
+}
+
 // Margen de seguridad del sync incremental: al watermark se le restan estos ms
 // antes de comparar contra el `last_updated` de cada item. Sobre-traer items
 // sin cambios es inofensivo (upsert idempotente del lado del plugin); perder
@@ -563,19 +637,59 @@ async function processPushJob(job) {
  * Solo tipos sync_* — push/auto_link los maneja el plugin (modelo A).
  */
 async function claimJob() {
+    // Excluir jobs en backoff por licencia vencida (devueltos a 'pending' tras un
+    // skip). Sin esto se re-claimearían cada tick y bloquearían a los demás.
+    const now = Date.now();
+    const deferred = [];
+    for (const [k, v] of _licenseSkipUntil.entries()) {
+        if (v >= now) deferred.push(k);
+    }
     const r = await query(
         `UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, NOW())
          WHERE id = (
             SELECT id FROM jobs
             WHERE status = 'pending'
               AND type IN ('sync_full', 'sync_incremental', 'push')
+              AND NOT (id = ANY($1::bigint[]))
             ORDER BY created_at ASC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
          )
-         RETURNING id, public_id, account_id, type, input, started_at`
+         RETURNING id, public_id, account_id, type, input, started_at`,
+        [deferred.length ? deferred.map((x) => Number(x)) : [0]]
     );
     return r.rowCount ? r.rows[0] : null;
+}
+
+/**
+ * Carga la cuenta del job y aplica el gate de licencia (CON gracia). Si la cuenta
+ * tiene licencia vencida/revocada fuera de gracia y el enforcement está activo,
+ * devuelve el job a 'pending' con backoff y retorna true (skip). NO pierde el job.
+ */
+async function jobBlockedByLicense(job) {
+    if (!_license || !_license.isLicenseActive() || !_license.isEnforcing()) return false;
+    let account;
+    try {
+        const accR = await query(
+            `SELECT id, public_id, license_id, license_exp, last_valid_license_token_at, revoked_at
+             FROM accounts WHERE id = $1`,
+            [job.account_id]
+        );
+        account = accR.rows[0];
+    } catch (e) {
+        // Si no podemos leer la cuenta, NO bloqueamos (fail-open de infra): el
+        // procesamiento normal ya revalida la cuenta y fallará limpio si no existe.
+        console.warn('[worker] license gate: no se pudo leer la cuenta — se permite:', e.message);
+        return false;
+    }
+    if (!account) return false; // processSyncJob/processPushJob lo manejan (cuenta no encontrada)
+
+    const verdict = licenseBlocksJob(account);
+    if (!verdict.blocked) return false;
+
+    console.warn(`[worker] job ${job.public_id} EN ESPERA — licencia ${verdict.reason} para cuenta ${account.public_id} (fuera de gracia). Se reintenta en ${LICENSE_SKIP_BACKOFF_MS / 60000}min.`);
+    await deferJobForLicense(job, verdict.reason);
+    return true;
 }
 
 async function tick() {
@@ -584,6 +698,11 @@ async function tick() {
     try {
         const job = await claimJob();
         if (!job) return;
+        // Gate de licencia (Fase 6): si la cuenta tiene licencia vencida/revocada
+        // fuera de gracia y enforcement activo, devolvemos el job a 'pending' (sin
+        // perderlo) y salimos del tick — el batch en curso de OTRO job no existe acá
+        // (un tick = un job), así que no cortamos nada a mitad.
+        if (await jobBlockedByLicense(job)) return;
         console.log(`[worker] tomando job ${job.public_id} (${job.type})`);
         try {
             await (job.type === 'push' ? processPushJob(job) : processSyncJob(job));
@@ -606,7 +725,9 @@ async function tick() {
 /**
  * Arranca el loop del worker. Llamado una vez desde server.js.
  */
-export function startWorker() {
+export function startWorker(opts = {}) {
+    // Enforcement de licencia (Fase 6): server.js inyecta el contexto compartido.
+    if (opts.license) _license = opts.license;
     if (!WORKER_ENABLED) {
         console.log('[worker] deshabilitado (WFML_WORKER_ENABLED=0)');
         return;

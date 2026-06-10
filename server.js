@@ -50,6 +50,14 @@ import { ping as dbPing, query as dbQuery } from './db.js';
 import { startWorker } from './worker.js';
 import { startScheduler } from './scheduler.js';
 import { createRateLimiter } from './rate-limit.js';
+import {
+    initLicenseContext,
+    getLicenseContext,
+    isEnforcing,
+    isLicenseActive,
+    replaceDenylist,
+    addToDenylist,
+} from './license-context.js';
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
 // para que el cliente pueda verificar qué build está corriendo sin acceso al
@@ -196,6 +204,31 @@ try {
 } catch (e) {
     console.error('[forger-connect-ml] FATAL: WFML_TOKEN_KEY no es base64 válido');
     process.exit(1);
+}
+
+// ============================================================================
+// Enforcement del capability-token de licencia (Fase 6).
+// ============================================================================
+// Init NO fail-fast: si falta/está mal la LICENSE_API_PUBLIC_KEY degrada a modo
+// "off" (no rompe el servicio). El modo efectivo (off|observe|enforce) y la
+// gracia quedan cacheados en license-context.js, que comparten routes-v1 + worker.
+//
+// Default LICENSE_ENFORCE = "observe": verifica + loguea quién no manda token,
+// pero NO bloquea a nadie. Para bloquear de verdad hay que setear "enforce".
+initLicenseContext(process.env);
+
+// Carga inicial + refresh periódico (60s) de la denylist desde license_denylist.
+// La denylist (revokes explícitos) gana SIEMPRE sobre la gracia. Si la DB no está
+// disponible, se loguea y se reintenta — nunca tumba el proceso.
+async function refreshDenylist() {
+    try {
+        const r = await dbQuery('SELECT license_id FROM license_denylist');
+        const n = replaceDenylist(r.rows.map((row) => row.license_id));
+        return n;
+    } catch (e) {
+        console.warn('[license] refreshDenylist error (se reintenta):', e.message);
+        return null;
+    }
 }
 
 // Mercado Pago es opcional (no fail-fast): solo informamos el estado al arrancar.
@@ -636,6 +669,13 @@ mountV1(app, {
     hubSecret: HUB_SECRET,
     rlGeneral:   limitV1General,
     rlHandshake: limitV1Handshake,
+    // Enforcement de licencia (Fase 6). El contexto es el MISMO objeto vivo de
+    // license-context.js — su denylist se refresca por el loop de refreshDenylist.
+    license: {
+        getContext:    getLicenseContext,
+        isEnforcing,
+        isLicenseActive,
+    },
 });
 
 // ============================================================================
@@ -664,6 +704,96 @@ app.get(['/version', '/connect-ml/version'], (req, res) => {
         started_at: STARTED_AT,
         ts: Date.now(),
     });
+});
+
+// ============================================================================
+// POST /internal/license-revoked — revocación EXPLÍCITA de una licencia.
+//
+// Lo llama el license-api/portal cuando una licencia se da de baja. Inserta el
+// license_id en license_denylist + lo agrega al Set en memoria sin esperar el
+// refresh de 60s. La denylist gana SIEMPRE sobre la gracia (corta al instante).
+//
+// Auth (defensa en capas, server-to-server, sin cookies):
+//   1. HMAC-SHA256(LICENSE_REVOKE_SECRET, raw_body) en header X-Wf-Revoke-Sig (hex),
+//      comparado timing-safe. Sin secret seteado el endpoint queda deshabilitado.
+//   2. Header X-Wf-Revoke-Ts (unix seconds) dentro de ±5min (anti-replay temporal).
+//   3. Nonce one-use en el body (reusa request_nonces, purpose='license_revoke').
+//
+// Respuesta genérica; el detalle solo a log. Idempotente (ON CONFLICT DO NOTHING).
+// ============================================================================
+app.post(['/internal/license-revoked', '/connect-ml/internal/license-revoked'], async (req, res) => {
+    const lic = getLicenseContext();
+    if (!lic.revokeSecret) {
+        // Sin secret no podemos autenticar — fail-closed para este endpoint.
+        return res.status(503).json({ ok: false, error: 'revoke_disabled' });
+    }
+
+    const sigGiven = String(req.get('X-Wf-Revoke-Sig') || '');
+    const tsGiven  = String(req.get('X-Wf-Revoke-Ts')  || '');
+    const raw      = req.rawBody || '';
+
+    if (!sigGiven || !tsGiven) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+
+    // 1) Verificar HMAC sobre el body crudo (constant-time).
+    let sigOk = false;
+    try {
+        const expected = crypto.createHmac('sha256', lic.revokeSecret).update(raw, 'utf8').digest('hex');
+        const a = Buffer.from(expected);
+        const b = Buffer.from(sigGiven);
+        sigOk = a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (_) { sigOk = false; }
+    if (!sigOk) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+
+    // 2) Ventana de timestamp ±5min (anti-replay temporal).
+    const tsNum = parseInt(tsGiven, 10);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > 300) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+
+    const body = req.body || {};
+    const licenseId = String(body.license_id || '').trim();
+    const reqNonce  = String(body.nonce || '').trim();
+    if (!licenseId) {
+        return res.status(400).json({ ok: false, error: 'missing_license_id' });
+    }
+
+    // 3) Nonce one-use (si vino). Reusa request_nonces; el ts firmado ya da
+    //    anti-replay temporal, pero el nonce evita re-uso dentro de la ventana.
+    if (reqNonce) {
+        try {
+            const dup = await dbQuery(
+                `INSERT INTO request_nonces (nonce, purpose, created_at) VALUES ($1, $2, $3)
+                 ON CONFLICT (nonce, purpose) DO NOTHING RETURNING nonce`,
+                [reqNonce, 'license_revoke', nowSec]
+            );
+            if (dup.rowCount === 0) {
+                return res.status(409).json({ ok: false, error: 'replay' });
+            }
+        } catch (e) {
+            console.error('[license-revoked] nonce insert error:', e.message);
+            return res.status(500).json({ ok: false, error: 'internal' });
+        }
+    }
+
+    // Persistir + actualizar el Set vivo.
+    try {
+        await dbQuery(
+            `INSERT INTO license_denylist (license_id, reason) VALUES ($1, $2)
+             ON CONFLICT (license_id) DO NOTHING`,
+            [licenseId, String(body.reason || '').slice(0, 500) || null]
+        );
+        addToDenylist(licenseId);
+        console.warn(`[license] license_id revocado y agregado a denylist: ${licenseId}`);
+        return res.json({ ok: true });
+    } catch (e) {
+        console.error('[license-revoked] db error:', e.message);
+        return res.status(500).json({ ok: false, error: 'internal' });
+    }
 });
 
 // ============================================================================
@@ -1743,11 +1873,26 @@ app.listen(PORT, () => {
     console.log(`[forger-connect-ml] CALLBACK_URL = ${CALLBACK_URL}`);
     // Arranca el worker del Central Orchestrator (procesa jobs de sync).
     // Si la DB no está disponible, el worker logguea el error y reintenta
-    // en el próximo tick — no tumba el proceso.
-    startWorker();
+    // en el próximo tick — no tumba el proceso. Le pasamos el contexto de
+    // licencia (Fase 6) para que saltee jobs de cuentas vencidas fuera de gracia.
+    startWorker({
+        license: {
+            getContext:    getLicenseContext,
+            isEnforcing,
+            isLicenseActive,
+        },
+    });
     // Arranca el scheduler — encola jobs de sync automático periódicamente.
     startScheduler();
     // Cleanup periódico de oauth_states + nonces vencidos. Cada 10 min.
     cleanupOAuthStates().catch(() => {});
     setInterval(() => { cleanupOAuthStates().catch(() => {}); }, 10 * 60 * 1000);
+    // Denylist de licencias (revokes explícitos): carga inicial + refresh cada 60s.
+    // unref() para no bloquear el shutdown del proceso. La denylist gana sobre la
+    // gracia, así que mantenerla fresca corta cuentas revocadas casi en tiempo real
+    // incluso sin el push directo de /internal/license-revoked.
+    refreshDenylist().then((n) => {
+        if (n != null) console.log(`[license] denylist cargada — ${n} license_id revocado(s).`);
+    }).catch(() => {});
+    setInterval(() => { refreshDenylist().catch(() => {}); }, 60 * 1000).unref();
 });

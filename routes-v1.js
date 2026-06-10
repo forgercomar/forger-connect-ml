@@ -29,6 +29,14 @@ import {
     generatePublicId,
     encryptToken,
 } from './auth.js';
+import { verifyCapabilityToken } from './license-token.js';
+
+// Header donde el satélite ML manda el capability-token de licencia (Fase 6).
+// (El central TN usa X-Wftn-License-Token con este MISMO archivo copiado.)
+const LICENSE_TOKEN_HEADER = 'X-Wfml-License-Token';
+
+// Producto que el token DEBE cubrir para autorizar al satélite ML.
+const LICENSE_EXPECT_PRODUCT = 'wf-mercadolibre';
 
 // =============================================================================
 // Constantes del job runtime
@@ -57,6 +65,101 @@ const VALID_JOB_TYPES = new Set([
 
 function nowIso() { return new Date().toISOString(); }
 
+// =============================================================================
+// Enforcement del capability-token de licencia (Fase 6)
+// =============================================================================
+//
+// El contexto (pública Ed25519, modo off|observe|enforce, gracia, denylist Set)
+// lo inyecta server.js vía mountV1(opts.license) y lo guardamos a nivel de módulo
+// para que authAccount (top-level) lo lea. Si nunca se inyecta (tests/standalone),
+// queda en null → se comporta como "off" (no bloquea nada).
+let _license = null; // { getContext, isEnforcing, isLicenseActive }
+
+/**
+ * Verifica el capability-token de un request contra el contexto de licencia.
+ *
+ * Pura respecto de la red: NO escribe DB acá (el caller decide cuándo sellar el
+ * last_valid_license_token_at). Devuelve un veredicto que el caller interpreta
+ * según el modo (off/observe/enforce) y según si aplica gracia.
+ *
+ * @param {string}  token        valor crudo del header X-Wfml-License-Token
+ * @param {object}  account      fila de accounts (para expectDomain = site_url)
+ * @returns {{ active, valid, reason, payload }}
+ *   - active: false → enforcement OFF (o sin pública); el caller debe permitir sin más.
+ *   - valid:  true  → token verificado OK (firma + exp + dominio + producto + no revocado).
+ *   - reason: detalle (solo a log) cuando valid=false.
+ *   - payload: claims decodificados (presente aunque valid=false en algunos casos).
+ */
+function verifyLicenseForAccount(token, account) {
+    if (!_license || !_license.isLicenseActive()) {
+        return { active: false, valid: false, reason: 'inactive', payload: null };
+    }
+    const ctx = _license.getContext();
+    const res = verifyCapabilityToken(String(token || ''), {
+        publicKey:     ctx.publicKey,
+        skewSec:       ctx.skewSec,
+        denylist:      ctx.denylist,
+        expectDomain:  account && account.site_url ? account.site_url : undefined,
+        expectProduct: LICENSE_EXPECT_PRODUCT,
+    });
+    return { active: true, valid: res.valid, reason: res.reason || null, payload: res.payload || null };
+}
+
+// Throttle del sello del watermark: el plugin pollea jobs agresivamente; sin
+// throttle escribiríamos accounts en CADA request /v1/* válido (el mismo problema
+// que motivó bumpAccountLastSeenThrottled). 60s de precisión sobra para la gracia
+// (que mide en horas). Se fuerza el write cuando cambia el claim (exp/license_id).
+const _stampCache = new Map(); // accountId → { at: epochMs, exp, licenseId }
+const STAMP_THROTTLE_MS = 60_000;
+setInterval(() => {
+    const cutoff = Date.now() - 60 * 60_000;
+    for (const [k, v] of _stampCache.entries()) {
+        if (v.at < cutoff) _stampCache.delete(k);
+    }
+}, 10 * 60_000).unref();
+
+/**
+ * Sella en accounts el último token VÁLIDO: ancla de la gracia + copia del claim.
+ * Fire-and-forget (no bloquea la respuesta). license_exp viene del claim.exp (sec).
+ * Throttle 60s/cuenta salvo que el claim haya cambiado (renovación/upgrade).
+ */
+function stampValidLicense(accountId, payload) {
+    if (!accountId || !payload) return;
+    const exp = typeof payload.exp === 'number' ? payload.exp : null;
+    const licenseId = payload.license_id ? String(payload.license_id) : null;
+    const prev = _stampCache.get(accountId);
+    const now = Date.now();
+    const claimChanged = !prev || prev.exp !== exp || prev.licenseId !== licenseId;
+    if (prev && !claimChanged && (now - prev.at) < STAMP_THROTTLE_MS) {
+        return; // ya sellado recientemente con el mismo claim
+    }
+    _stampCache.set(accountId, { at: now, exp, licenseId });
+    query(
+        `UPDATE accounts
+            SET last_valid_license_token_at = NOW(),
+                license_id  = COALESCE($2, license_id),
+                license_exp = CASE WHEN $3::bigint IS NOT NULL THEN to_timestamp($3) ELSE license_exp END
+          WHERE id = $1`,
+        [accountId, licenseId, exp]
+    ).catch((e) => console.warn('[license] stampValidLicense failed:', e.message));
+}
+
+/**
+ * ¿La cuenta está dentro del período de gracia? Permite seguir operando jobs
+ * (sync/push) ante token ausente/expirado por caída de infra del license-api,
+ * SIEMPRE que haya presentado un token válido dentro de GRACE_PERIOD_SEC.
+ * La gracia NO aplica al handshake (entrada nueva) ni vence una denylist.
+ */
+function withinGrace(account) {
+    if (!_license) return false;
+    const ctx = _license.getContext();
+    const ts = account && account.last_valid_license_token_at
+        ? new Date(account.last_valid_license_token_at).getTime()
+        : 0;
+    if (!ts) return false;
+    return (Date.now() - ts) <= ctx.gracePeriodSec * 1000;
+}
+
 /**
  * Acceso al body crudo (string). Lo necesitamos para verificar el HMAC, que
  * incluye el sha256 del body original. Express ya lo parseó a req.body, pero
@@ -82,7 +185,8 @@ async function authAccount(req, res, next) {
     let acc;
     try {
         const r = await query(
-            `SELECT id, public_id, ml_user_id, ml_nickname, ml_site_id, site_url, shared_secret, revoked_at
+            `SELECT id, public_id, ml_user_id, ml_nickname, ml_site_id, site_url, shared_secret, revoked_at,
+                    last_valid_license_token_at, license_id, license_exp
              FROM accounts WHERE public_id = $1`,
             [publicId]
         );
@@ -104,6 +208,37 @@ async function authAccount(req, res, next) {
     if (!verdict.ok) {
         return res.status(401).json({ ok: false, error: 'bad_signature', message: verdict.reason });
     }
+
+    // -------------------------------------------------------------------------
+    // Capability-token de licencia (Fase 6) — capa ADICIONAL sobre el HMAC.
+    // CON gracia: si el token falta/expiró pero la cuenta presentó uno válido
+    // dentro de GRACE_PERIOD_SEC, permitimos igual (no romper operación por una
+    // caída del license-api). La denylist (revoke explícito) GANA sobre la gracia.
+    // En modo "observe" se loguea pero NUNCA se bloquea. En "off" no se verifica.
+    // -------------------------------------------------------------------------
+    const lic = verifyLicenseForAccount(req.get(LICENSE_TOKEN_HEADER), acc);
+    if (lic.active) {
+        if (lic.valid) {
+            // Token OK → sella el ancla de gracia + copia del claim (fire-and-forget).
+            stampValidLicense(acc.id, lic.payload);
+        } else {
+            const revoked = lic.reason === 'revoked';
+            const graced = !revoked && withinGrace(acc);
+            const enforcing = _license.isEnforcing();
+            if (!graced) {
+                if (enforcing) {
+                    console.warn(`[license] BLOQUEADO acct=${acc.public_id} reason=${lic.reason}` +
+                        (revoked ? ' (revoked: denylist gana sobre gracia)' : ' (sin gracia válida)'));
+                    return res.status(403).json({ ok: false, error: 'license_invalid' });
+                }
+                console.warn(`[license][observe] permitiría-bloquear acct=${acc.public_id} reason=${lic.reason}` +
+                    (revoked ? ' (revoked)' : '') + ' (modo observe — no se bloquea)');
+            } else {
+                console.warn(`[license] acct=${acc.public_id} token ${lic.reason} pero DENTRO de gracia — permitido`);
+            }
+        }
+    }
+
     req.account = acc;
     // Bump last_seen para detección de actividad. Fire-and-forget + throttle.
     // Antes pegabamos a Postgres en CADA request /v1/* — con polling agresivo
@@ -205,6 +340,9 @@ export function mountV1(app, opts = {}) {
     // limiters (compat con tests / standalone), no-op.
     const rlGeneral   = opts.rlGeneral   || ((req, res, next) => next());
     const rlHandshake = opts.rlHandshake || ((req, res, next) => next());
+    // Enforcement de licencia (Fase 6). Lo inyecta server.js; si no, queda en
+    // null → authAccount/handshake se comportan como "off" (no bloquean).
+    if (opts.license) _license = opts.license;
     // Registramos cada ruta con DOS paths: el "limpio" /v1/* y el prefijado
     // /connect-ml/v1/*. Esto es por el reverse proxy de EasyPanel: el dominio
     // goforger.com sirve a comingsoon en la raíz, y solo enruta /connect-ml/*
@@ -235,6 +373,31 @@ export function mountV1(app, opts = {}) {
     // -------------------------------------------------------------------------
     app.post(p('/v1/handshake'), rlHandshake, async (req, res) => {
         const body = req.body || {};
+
+        // ---------------------------------------------------------------------
+        // Capability-token de licencia (Fase 6) — SIN gracia.
+        // El handshake registra/rota el shared_secret: es una ENTRADA NUEVA, no
+        // una operación recurrente, así que NO le aplica el período de gracia.
+        // expectDomain = site_url del body (la cuenta puede no existir aún). En
+        // modo "observe" se loguea pero NO se bloquea; en "off" no se verifica.
+        // Esto va ANTES de validar la firma del handshake (gate de licencia primero).
+        // ---------------------------------------------------------------------
+        let hsLicensePayload = null; // claim del token válido, para sellar tras el upsert
+        {
+            const hsAccount = { site_url: String(body.site_url || '') };
+            const lic = verifyLicenseForAccount(req.get(LICENSE_TOKEN_HEADER), hsAccount);
+            if (lic.active) {
+                if (lic.valid) {
+                    hsLicensePayload = lic.payload;
+                } else if (_license.isEnforcing()) {
+                    console.warn(`[license] handshake BLOQUEADO site=${hsAccount.site_url} reason=${lic.reason} (sin gracia)`);
+                    return res.status(403).json({ ok: false, error: 'license_invalid' });
+                } else {
+                    console.warn(`[license][observe] handshake permitiría-bloquear site=${hsAccount.site_url} reason=${lic.reason} (modo observe)`);
+                }
+            }
+        }
+
         const sigGiven = String(body.handshake_sig || '');
         if (!sigGiven) {
             return res.status(400).json({ ok: false, error: 'missing_sig' });
@@ -337,6 +500,10 @@ export function mountV1(app, opts = {}) {
                 );
                 accId = ins.rows[0].id;
             }
+
+            // Si el handshake trajo un token VÁLIDO, sellamos el ancla de gracia
+            // + copia del claim ahora que la cuenta existe (fire-and-forget).
+            if (hsLicensePayload) stampValidLicense(accId, hsLicensePayload);
 
             return res.json({
                 ok: true,
