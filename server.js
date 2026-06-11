@@ -57,6 +57,7 @@ import {
     isLicenseActive,
     replaceDenylist,
     addToDenylist,
+    removeFromDenylist,
 } from './license-context.js';
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
@@ -792,6 +793,95 @@ app.post(['/internal/license-revoked', '/connect-ml/internal/license-revoked'], 
         return res.json({ ok: true });
     } catch (e) {
         console.error('[license-revoked] db error:', e.message);
+        return res.status(500).json({ ok: false, error: 'internal' });
+    }
+});
+
+// ============================================================================
+// POST /internal/license-activated — ESPEJO EXACTO de /internal/license-revoked.
+//
+// Lo llama el license-api cuando una licencia se DES-bloquea (un-revoke) y su
+// status NO es bloqueante. BORRA el license_id de license_denylist + lo saca del
+// Set en memoria sin esperar el refresh de 60s.
+//
+// Auth idéntica al revoke (server-to-server, sin cookies):
+//   1. HMAC-SHA256(LICENSE_REVOKE_SECRET, raw_body) en header X-Wf-Revoke-Sig (hex),
+//      comparado timing-safe. Sin secret seteado el endpoint queda deshabilitado.
+//   2. Header X-Wf-Revoke-Ts (unix seconds) dentro de ±5min (anti-replay temporal).
+//   3. Nonce one-use en el body (reusa request_nonces, purpose='license_activate' —
+//      DISTINTO del revoke para no chocar el mismo nonce entre ambos endpoints).
+//
+// Respuesta genérica; el detalle solo a log. Idempotente (DELETE sin filas = ok).
+// ============================================================================
+app.post(['/internal/license-activated', '/connect-ml/internal/license-activated'], async (req, res) => {
+    const lic = getLicenseContext();
+    if (!lic.revokeSecret) {
+        // Sin secret no podemos autenticar — fail-closed para este endpoint.
+        return res.status(503).json({ ok: false, error: 'revoke_disabled' });
+    }
+
+    const sigGiven = String(req.get('X-Wf-Revoke-Sig') || '');
+    const tsGiven  = String(req.get('X-Wf-Revoke-Ts')  || '');
+    const raw      = req.rawBody || '';
+
+    if (!sigGiven || !tsGiven) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+
+    // 1) Verificar HMAC sobre el body crudo (constant-time).
+    let sigOk = false;
+    try {
+        const expected = crypto.createHmac('sha256', lic.revokeSecret).update(raw, 'utf8').digest('hex');
+        const a = Buffer.from(expected);
+        const b = Buffer.from(sigGiven);
+        sigOk = a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (_) { sigOk = false; }
+    if (!sigOk) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+
+    // 2) Ventana de timestamp ±5min (anti-replay temporal).
+    const tsNum = parseInt(tsGiven, 10);
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > 300) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+
+    const body = req.body || {};
+    const licenseId = String(body.license_id || '').trim();
+    const reqNonce  = String(body.nonce || '').trim();
+    if (!licenseId) {
+        return res.status(400).json({ ok: false, error: 'missing_license_id' });
+    }
+
+    // 3) Nonce one-use (si vino). purpose 'license_activate' — distinto del revoke.
+    if (reqNonce) {
+        try {
+            const dup = await dbQuery(
+                `INSERT INTO request_nonces (nonce, purpose, created_at) VALUES ($1, $2, $3)
+                 ON CONFLICT (nonce, purpose) DO NOTHING RETURNING nonce`,
+                [reqNonce, 'license_activate', nowSec]
+            );
+            if (dup.rowCount === 0) {
+                return res.status(409).json({ ok: false, error: 'replay' });
+            }
+        } catch (e) {
+            console.error('[license-activated] nonce insert error:', e.message);
+            return res.status(500).json({ ok: false, error: 'internal' });
+        }
+    }
+
+    // Borrar de la tabla + sacar del Set vivo.
+    try {
+        await dbQuery(
+            `DELETE FROM license_denylist WHERE license_id = $1`,
+            [licenseId]
+        );
+        removeFromDenylist(licenseId);
+        console.warn(`[license] license_id des-bloqueado y removido de denylist: ${licenseId}`);
+        return res.json({ ok: true });
+    } catch (e) {
+        console.error('[license-activated] db error:', e.message);
         return res.status(500).json({ ok: false, error: 'internal' });
     }
 });

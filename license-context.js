@@ -123,3 +123,8 @@ export function replaceDenylist(licenseIds) {
 export function addToDenylist(licenseId) {
     if (licenseId) ctx.denylist.add(String(licenseId));
 }
+
+/** Saca un license_id de la denylist viva (usado por el endpoint de un-revoke). */
+export function removeFromDenylist(licenseId) {
+    if (licenseId) ctx.denylist.delete(String(licenseId));
+}
