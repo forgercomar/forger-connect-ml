@@ -28,6 +28,8 @@ import {
     generateSecret,
     generatePublicId,
     encryptToken,
+    sealSecret,
+    openSecret,
 } from './auth.js';
 import { verifyCapabilityToken } from './license-token.js';
 
@@ -197,8 +199,17 @@ async function authAccount(req, res, next) {
     if (!acc || acc.revoked_at) {
         return res.status(401).json({ ok: false, error: 'unknown_account' });
     }
+    // shared_secret puede estar cifrado at-rest (formato enc1) o plano (fila
+    // legacy). openSecret resuelve ambos; null = no se pudo descifrar (key
+    // rotada sin migrar / fila corrupta) → falla la auth de ESA cuenta, sin
+    // tirar el proceso. JAMÁS loguear el secreto.
+    const accSecret = openSecret(acc.shared_secret);
+    if (!accSecret) {
+        console.warn(`[v1] shared_secret ilegible acct=${acc.public_id} (key rotada o fila corrupta) — auth rechazada`);
+        return res.status(401).json({ ok: false, error: 'secret_unreadable', message: 'No se pudo validar el secreto de la cuenta. Reconectá la cuenta (handshake).' });
+    }
     const verdict = verifyRequest({
-        secret: acc.shared_secret,
+        secret: accSecret,
         method: req.method,
         path: req.originalUrl.split('?')[0], // sin query string
         ts,
@@ -462,6 +473,15 @@ export function mountV1(app, opts = {}) {
         }
 
         const newSecret = generateSecret();
+        // At-rest: el secret viaja PLANO al plugin (protocolo intacto) pero en
+        // la DB se persiste cifrado (formato enc1, ver auth.js). Si la key de
+        // cifrado falta → 500 explícito, nunca guardar plano por accidente.
+        let storedSecret;
+        try {
+            storedSecret = sealSecret(newSecret);
+        } catch (err) {
+            return res.status(500).json({ ok: false, error: 'crypto_failed', message: err.message });
+        }
         let enc = { ciphertext: '', iv: '' };
         if (refreshT) {
             try {
@@ -491,7 +511,7 @@ export function mountV1(app, opts = {}) {
                          refresh_token_iv  = COALESCE(NULLIF($7, ''), refresh_token_iv),
                          last_token_refresh_at = CASE WHEN $6 <> '' THEN NOW() ELSE last_token_refresh_at END
                      WHERE id = $1`,
-                    [accId, nick, siteId, siteUrl, newSecret, enc.ciphertext, enc.iv]
+                    [accId, nick, siteId, siteUrl, storedSecret, enc.ciphertext, enc.iv]
                 );
             } else {
                 accPublic = generatePublicId('acc');
@@ -502,7 +522,7 @@ export function mountV1(app, opts = {}) {
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
                              CASE WHEN $7 <> '' THEN NOW() ELSE NULL END)
                      RETURNING id`,
-                    [accPublic, mlUserId, nick, siteId, siteUrl, newSecret, enc.ciphertext, enc.iv]
+                    [accPublic, mlUserId, nick, siteId, siteUrl, storedSecret, enc.ciphertext, enc.iv]
                 );
                 accId = ins.rows[0].id;
             }

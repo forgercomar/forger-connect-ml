@@ -59,6 +59,7 @@ import {
     addToDenylist,
     removeFromDenylist,
 } from './license-context.js';
+import { verifyCapabilityToken, normalizeDomain } from './license-token.js';
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
 // para que el cliente pueda verificar qué build está corriendo sin acceso al
@@ -1491,6 +1492,45 @@ function mpConfirmationPage({ payload, returnTo, nonce, siteUrl }) {
 </body></html>`;
 }
 
+// ----------------------------------------------------------------------------
+// Licencia en rutas MP (Fase 6) — flag SEPARADO del enforcement de ML.
+//
+// MP_LICENSE_ENFORCE: off | observe | enforce (default "observe"). El modo
+// efectivo nunca supera la infra del contexto global: sin pública Ed25519 → off.
+// El token viaja del plugin como param `cap` (start) / campo `license_token`
+// (refresh) — EXTRA, fuera de los canon firmados con HUB_SECRET → un plugin
+// viejo que no lo manda sigue funcionando (en observe solo se loguea).
+// ----------------------------------------------------------------------------
+const MP_LICENSE_MODE = (() => {
+    const req = String(process.env.MP_LICENSE_ENFORCE || 'observe').trim().toLowerCase();
+    return ['off', 'observe', 'enforce'].includes(req) ? req : 'observe';
+})();
+
+function mpLicenseCheck(token, siteUrl) {
+    const lic = getLicenseContext();
+    const mode = lic.publicKey ? MP_LICENSE_MODE : 'off';
+    if (mode === 'off') return { allow: true, mode, reason: 'off' };
+    const opts = {
+        publicKey: lic.publicKey,
+        skewSec: lic.skewSec,
+        denylist: lic.denylist,
+        expectProduct: 'wf-mercadopago',
+    };
+    const dom = normalizeDomain(String(siteUrl || ''));
+    if (dom) opts.expectDomain = dom;
+    const v = verifyCapabilityToken(String(token || ''), opts);
+    if (v.valid) return { allow: true, mode, reason: 'ok' };
+    // El verifier chequea exp ANTES que denylist → un token vencido de una
+    // licencia REVOCADA daría 'expired' y el corte por denylist sería letra
+    // muerta pasada la TTL (1h). La firma Ed25519 se verifica antes del exp →
+    // el license_id del payload es auténtico aunque venza: elevar a 'revoked'.
+    let reason = v.reason || 'invalid';
+    if (reason === 'expired' && v.payload && v.payload.license_id && lic.denylist.has(String(v.payload.license_id))) {
+        reason = 'revoked';
+    }
+    return { allow: mode !== 'enforce', mode, reason };
+}
+
 // GET /connect-mp — inicio del flow OAuth de Mercado Pago.
 app.get('/connect-mp', limitMpOauthStart, async (req, res) => {
     if (!MP_ENABLED) return res.status(503).type('html').send(mpDisabledPage());
@@ -1523,6 +1563,18 @@ app.get('/connect-mp', limitMpOauthStart, async (req, res) => {
     } catch (e) {
         console.error('[connect-mp] nonce check error:', e.message);
         return res.status(500).type('html').send(htmlPage('Error', `<h1 class="err">⚠ Error interno</h1>`));
+    }
+    // Licencia (capability-token, param extra `cap`). En enforce, una licencia
+    // inválida/revocada bloquea SOLO la conexión NUEVA (inocuo: no toca cuentas
+    // ya conectadas ni cobros en curso).
+    const mpLicStart = mpLicenseCheck(req.query.cap, String(site_url));
+    if (mpLicStart.mode !== 'off') {
+        console.log(`[connect-mp][license][${mpLicStart.mode}] start: ${mpLicStart.reason} site=${normalizeDomain(String(site_url))}`);
+    }
+    if (!mpLicStart.allow) {
+        return res.status(403).type('html').send(htmlPage('Licencia requerida',
+            `<h1 class="err">⚠ Licencia de Forger MercadoPago inválida o vencida</h1>
+            <p>Renová tu suscripción en goforger.com y volvé a intentar la conexión.</p>`));
     }
     // State opaco server-side.
     let stateId;
@@ -1747,6 +1799,18 @@ app.post('/connect-mp/refresh-token', limitMpFinishRefresh, async (req, res) => 
         const receivedBuf = Buffer.from(payload_sig);
         if (expectedBuf.length !== receivedBuf.length || !crypto.timingSafeEqual(expectedBuf, receivedBuf)) {
             return res.status(403).json({ ok: false, error: 'invalid signature' });
+        }
+        // Licencia (capability-token, campos extra `license_token` + `site_url`).
+        // Aún en enforce, acá SOLO la denylist corta (revoke explícito): un corte
+        // por vencimiento brickearía lentamente el checkout de un cliente pago, y
+        // la tab Credenciales (token manual) es un bypass soportado → el premio no
+        // justifica ese riesgo. Vencida/sin-token queda en observe (solo log).
+        const mpLicRef = mpLicenseCheck(req.body && req.body.license_token, req.body && req.body.site_url);
+        if (mpLicRef.mode !== 'off') {
+            console.log(`[connect-mp][license][${mpLicRef.mode}] refresh: ${mpLicRef.reason}`);
+        }
+        if (mpLicRef.mode === 'enforce' && mpLicRef.reason === 'revoked') {
+            return res.status(403).json({ ok: false, error: 'license_invalid' });
         }
         try {
             const resp = await fetch(MP_TOKEN_URL, {
