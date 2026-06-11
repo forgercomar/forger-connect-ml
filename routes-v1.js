@@ -221,6 +221,12 @@ async function authAccount(req, res, next) {
         if (lic.valid) {
             // Token OK → sella el ancla de gracia + copia del claim (fire-and-forget).
             stampValidLicense(acc.id, lic.payload);
+            // En observe logueamos también el caso OK → confirmación visible de que el
+            // token llega y verifica (en enforce queda silencioso para no hacer ruido).
+            if (!_license.isEnforcing()) {
+                const _exp = lic.payload && typeof lic.payload.exp === 'number' ? (lic.payload.exp - Math.floor(Date.now() / 1000)) : '?';
+                console.log(`[license][observe] token OK acct=${acc.public_id} license=${String((lic.payload && lic.payload.license_id) || '').slice(0, 8)} exp_in=${_exp}s`);
+            }
         } else {
             const revoked = lic.reason === 'revoked';
             const graced = !revoked && withinGrace(acc);
