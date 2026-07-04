@@ -49,7 +49,8 @@
 
 import { query } from './db.js';
 import { generatePublicId } from './auth.js';
-import { getValidAccessToken, mlGetOrder } from './ml-api.js';
+import { getValidAccessToken, mlGetOrder, mlSearchOrders } from './ml-api.js';
+import { enrichOrder, upsertOrderSnapshot } from './orders-snapshot.js';
 
 const AUTOSYNC_ENABLED = process.env.WFML_AUTOSYNC_ENABLED !== '0';
 const INTERVAL_HOURS   = Math.max(1, Number(process.env.WFML_AUTOSYNC_INTERVAL_HOURS) || 6);
@@ -63,6 +64,26 @@ const WEBHOOK_BATCH_INTERVAL = Math.max(15000, Number(process.env.WFML_WEBHOOK_B
 
 const ORDER_ENABLED  = process.env.WFML_ORDER_ENABLED !== '0';
 const ORDER_INTERVAL = Math.max(15000, Number(process.env.WFML_ORDER_INTERVAL) || 60000);
+
+// Backfill histórico de órdenes (Ventas ML, F0): procesa jobs 'orders_backfill'
+// en su propio loop — NO en el worker, para que un backfill de miles de órdenes
+// no bloquee syncs ni pushes (el worker es serial).
+const BACKFILL_ENABLED        = process.env.WFML_BACKFILL_ENABLED !== '0';
+const BACKFILL_CHECK_INTERVAL = Math.max(15000, Number(process.env.WFML_BACKFILL_CHECK_INTERVAL) || 60000);
+const BACKFILL_PAGE           = 50;   // cap de ML en orders/search
+const BACKFILL_OFFSET_CAP     = 1000; // pasado esto se re-ventanea por fecha (cap de offset de ML)
+const BACKFILL_PAUSE_MS       = Math.max(0, Number(process.env.WFML_BACKFILL_PAUSE_MS ?? 150) || 0);
+// El shipment se enriquece solo para órdenes recientes (el estado de envío es
+// operativo); para las viejas alcanza con los tags de la orden (delivered/...).
+const BACKFILL_SHIPMENT_DAYS  = Math.max(0, Number(process.env.WFML_BACKFILL_SHIPMENT_DAYS) || 45);
+
+// Retención: purga las filas de cola YA ENTREGADAS/PROCESADAS con más de
+// RETENTION_DAYS días (order_events entregadas, synced_items entregados,
+// webhook_events procesados). Nunca toca filas sin entregar ni los
+// order_snapshots (esos son el historial de Ventas ML, se conservan).
+const RETENTION_ENABLED        = process.env.WFML_RETENTION_ENABLED !== '0';
+const RETENTION_DAYS           = Math.max(7, Number(process.env.WFML_RETENTION_DAYS) || 30);
+const RETENTION_CHECK_INTERVAL = Math.max(3600000, Number(process.env.WFML_RETENTION_CHECK_INTERVAL) || 6 * 3600000);
 
 // Janitor de jobs zombie: si el worker crashea a mitad de un job, queda en
 // status='running' para siempre porque claimJob() filtra status='pending'. Este
@@ -86,6 +107,10 @@ let _busy = false;
 let _webhookBusy = false;
 let _orderBusy = false;
 let _zombieBusy = false;
+let _backfillBusy = false;
+let _retentionBusy = false;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Busca las cuentas activas que necesitan un sync automático y encola un job
@@ -302,6 +327,16 @@ async function processOrderEvents() {
                 const order = await mlGetOrder(account, token, mlOrderId);
                 const status = String(order.status || '');
                 const items = extractOrderItems(order);
+                // Ventas ML (F0): snapshot completo ANTES de marcar procesada,
+                // así /v1/orders/pending ya lo encuentra al entregar. Tolerante:
+                // si el snapshot falla, el stock no queda rehén — la orden se
+                // entrega igual (sin order/billing) y un evento futuro lo completa.
+                try {
+                    const enrich = await enrichOrder(account, token, order);
+                    await upsertOrderSnapshot(accountId, order, enrich);
+                } catch (err) {
+                    console.warn(`[scheduler] snapshot de orden ${mlOrderId} falló (la orden sigue):`, err.message);
+                }
                 await query(
                     `UPDATE order_events
                      SET processed_at = NOW(), order_status = $2, items_json = $3, error = NULL
@@ -329,6 +364,208 @@ async function orderTick() {
         console.error('[scheduler] order tick error:', err.message);
     } finally {
         _orderBusy = false;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Backfill histórico de órdenes (Ventas ML, F0)
+// ----------------------------------------------------------------------------
+
+/**
+ * Toma un job 'orders_backfill' pending. Mismo lock SKIP LOCKED que el worker,
+ * pero acá — el worker no conoce este tipo (su claimJob no lo lista) y así un
+ * backfill largo nunca bloquea syncs ni pushes. last_seen_at se sella al claim
+ * para que el janitor zombie cubra un crash inmediato.
+ */
+async function claimBackfillJob() {
+    const r = await query(
+        `UPDATE jobs SET status = 'running',
+                         started_at = COALESCE(started_at, NOW()),
+                         last_seen_at = NOW()
+         WHERE id = (
+            SELECT id FROM jobs
+            WHERE status = 'pending' AND type = 'orders_backfill'
+            ORDER BY created_at ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+         )
+         RETURNING id, public_id, account_id, input, started_at`
+    );
+    return r.rowCount ? r.rows[0] : null;
+}
+
+/** ¿El job sigue vivo? (cancelable desde /v1/jobs/:id/cancel) */
+async function backfillJobActive(jobId) {
+    const r = await query(`SELECT status FROM jobs WHERE id = $1`, [jobId]);
+    return r.rowCount > 0 && r.rows[0].status === 'running';
+}
+
+/**
+ * Importa el historial de órdenes ML de una cuenta a order_snapshots.
+ *
+ * Pagina /orders/search de la más nueva a la más vieja (sort=date_desc) desde
+ * hace `input.months` meses. ML capa el offset, así que al acercarse al cap se
+ * "re-ventanea": el `to` de la ventana pasa a ser el date_created más viejo
+ * visto y el offset vuelve a 0. El solape del borde es inofensivo (upsert).
+ *
+ * Cada orden se enriquece con billing_info (siempre — datos fiscales para
+ * facturar) y shipment (solo órdenes de los últimos BACKFILL_SHIPMENT_DAYS
+ * días — el estado de envío es operativo, para las viejas alcanzan los tags).
+ * Un fallo de enriquecimiento no frena la orden; un fallo de la orden no
+ * frena el job (se loguea y sigue).
+ */
+async function processBackfillJob(job) {
+    const accR = await query(`SELECT * FROM accounts WHERE id = $1`, [job.account_id]);
+    if (!accR.rowCount) throw new Error('cuenta no encontrada');
+    const account = accR.rows[0];
+    if (account.revoked_at) throw new Error('cuenta revocada');
+    const token = await getValidAccessToken(account);
+
+    const input  = (job.input && typeof job.input === 'object') ? job.input : {};
+    const months = Math.min(24, Math.max(1, Number(input.months) || 12));
+    const fromD  = new Date();
+    fromD.setMonth(fromD.getMonth() - months);
+    const fromIso      = fromD.toISOString().replace('Z', '-00:00'); // formato de fecha que ML documenta
+    const shipCutoffMs = Date.now() - BACKFILL_SHIPMENT_DAYS * 86400000;
+
+    let windowTo = null;   // 'to' de la ventana actual (null = hasta hoy)
+    let prevWindowTo = null;
+    let offset = 0;
+    let orders = 0, pages = 0, billingMiss = 0, shipments = 0;
+
+    for (;;) {
+        if (!(await backfillJobActive(job.id))) {
+            console.log(`[scheduler] backfill ${job.public_id} cancelado a mitad — corto.`);
+            return;
+        }
+        const page = await mlSearchOrders(account, token, {
+            from: fromIso, to: windowTo, offset, limit: BACKFILL_PAGE, sort: 'date_desc',
+        });
+        if (pages === 0) {
+            await query(
+                `UPDATE jobs SET steps_total = $2, message = $3 WHERE id = $1`,
+                [job.id, Math.max(1, Math.ceil(page.total / BACKFILL_PAGE)),
+                 `Importando ${page.total} venta(s) de Mercado Libre (últimos ${months} meses)...`]
+            );
+        }
+        if (!page.results.length) break;
+
+        let oldest = null; // date_created más viejo de la página (para re-ventanear)
+        for (const order of page.results) {
+            if (!order || order.id == null) continue;
+            const dcMs = order.date_created ? new Date(order.date_created).getTime() : 0;
+            if (dcMs && (!oldest || dcMs < oldest.ms)) oldest = { ms: dcMs, iso: String(order.date_created) };
+            try {
+                const enrich = await enrichOrder(account, token, order, {
+                    shipment: dcMs >= shipCutoffMs,
+                });
+                if (!enrich.billing) billingMiss++;
+                if (enrich.shipment) shipments++;
+                await upsertOrderSnapshot(job.account_id, order, enrich);
+                orders++;
+            } catch (err) {
+                console.error(`[scheduler] backfill orden ${order.id} falló (sigue):`, err.message);
+            }
+            if (BACKFILL_PAUSE_MS) await sleep(BACKFILL_PAUSE_MS);
+        }
+        pages++;
+        await query(
+            `UPDATE jobs SET steps_done = $2, message = $3, last_seen_at = NOW() WHERE id = $1`,
+            [job.id, pages, `Importadas ${orders} venta(s)...`]
+        );
+
+        if (page.results.length < BACKFILL_PAGE) break; // última página — no hay más viejas
+
+        offset += BACKFILL_PAGE;
+        if (offset + BACKFILL_PAGE > BACKFILL_OFFSET_CAP) {
+            // Cap de offset de ML → re-ventanear desde la fecha más vieja vista.
+            if (!oldest) break;
+            if (oldest.iso === prevWindowTo) break; // sin progreso → cortar
+            prevWindowTo = windowTo = oldest.iso;
+            offset = 0;
+        }
+    }
+
+    await query(
+        `UPDATE jobs SET status = 'done', finished_at = NOW(), result = $2, message = $3
+         WHERE id = $1 AND status = 'running'`,
+        [job.id,
+         JSON.stringify({ mode: 'orders_backfill', months, orders, pages, billing_missing: billingMiss, shipments }),
+         `Historial importado: ${orders} venta(s) de los últimos ${months} meses.`]
+    );
+    console.log(`[scheduler] backfill ${job.public_id} done — ${orders} órdenes, ${pages} página(s), ${billingMiss} sin billing`);
+}
+
+async function backfillTick() {
+    if (_backfillBusy) return;
+    _backfillBusy = true;
+    try {
+        const job = await claimBackfillJob();
+        if (!job) return;
+        console.log(`[scheduler] tomando backfill ${job.public_id}`);
+        try {
+            await processBackfillJob(job);
+        } catch (err) {
+            console.error(`[scheduler] backfill ${job.public_id} falló:`, err.message);
+            await query(
+                `UPDATE jobs SET status = 'failed', finished_at = NOW(), message = $2
+                 WHERE id = $1 AND status = 'running'`,
+                [job.id, 'Error: ' + err.message]
+            );
+        }
+    } catch (err) {
+        console.error('[scheduler] backfill tick error:', err.message);
+    } finally {
+        _backfillBusy = false;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Retención de colas entregadas
+// ----------------------------------------------------------------------------
+
+/**
+ * Purga por lotes las filas de cola que ya cumplieron su ciclo hace más de
+ * RETENTION_DAYS días. Solo filas ENTREGADAS (order_events/synced_items) o
+ * PROCESADAS (webhook_events) — lo pendiente no se toca jamás, y los
+ * order_snapshots tampoco (son el historial de Ventas ML). Antes de esto no
+ * había NINGUNA retención y las tres tablas crecían sin límite.
+ */
+async function purgeDeliveredRows() {
+    const targets = [
+        ['order_events',
+         `DELETE FROM order_events WHERE id IN (
+             SELECT id FROM order_events
+             WHERE delivered_at IS NOT NULL AND delivered_at < NOW() - ($1 || ' days')::interval
+             LIMIT 5000)`],
+        ['synced_items',
+         `DELETE FROM synced_items WHERE id IN (
+             SELECT id FROM synced_items
+             WHERE delivered_at IS NOT NULL AND delivered_at < NOW() - ($1 || ' days')::interval
+             LIMIT 5000)`],
+        ['webhook_events',
+         `DELETE FROM webhook_events WHERE id IN (
+             SELECT id FROM webhook_events
+             WHERE processed_at IS NOT NULL AND processed_at < NOW() - ($1 || ' days')::interval
+             LIMIT 5000)`],
+    ];
+    for (const [name, sql] of targets) {
+        const r = await query(sql, [String(RETENTION_DAYS)]);
+        if (r.rowCount) {
+            console.log(`[scheduler] retención — ${r.rowCount} fila(s) purgadas de ${name} (>${RETENTION_DAYS}d entregadas)`);
+        }
+    }
+}
+
+async function retentionTick() {
+    if (_retentionBusy) return;
+    _retentionBusy = true;
+    try {
+        await purgeDeliveredRows();
+    } catch (err) {
+        console.error('[scheduler] retention tick error:', err.message);
+    } finally {
+        _retentionBusy = false;
     }
 }
 
@@ -423,7 +660,29 @@ export function startScheduler() {
         console.log('[scheduler] procesador de órdenes deshabilitado (WFML_ORDER_ENABLED=0)');
     }
 
-    // Loop 4 — janitor de jobs zombie.
+    // Loop 4 — backfill histórico de órdenes (Ventas ML).
+    if (BACKFILL_ENABLED) {
+        console.log(`[scheduler] backfill de órdenes — chequeo cada ${Math.round(BACKFILL_CHECK_INTERVAL / 1000)}s`);
+        setTimeout(() => {
+            backfillTick().catch((e) => console.error('[scheduler] first backfill tick uncaught:', e));
+            setInterval(() => { backfillTick().catch((e) => console.error('[scheduler] backfill tick uncaught:', e)); }, BACKFILL_CHECK_INTERVAL);
+        }, FIRST_RUN_DELAY);
+    } else {
+        console.log('[scheduler] backfill de órdenes deshabilitado (WFML_BACKFILL_ENABLED=0)');
+    }
+
+    // Loop 5 — retención de colas entregadas.
+    if (RETENTION_ENABLED) {
+        console.log(`[scheduler] retención — purga entregadas >${RETENTION_DAYS}d, chequeo cada ${Math.round(RETENTION_CHECK_INTERVAL / 3600000)}h`);
+        setTimeout(() => {
+            retentionTick().catch((e) => console.error('[scheduler] first retention tick uncaught:', e));
+            setInterval(() => { retentionTick().catch((e) => console.error('[scheduler] retention tick uncaught:', e)); }, RETENTION_CHECK_INTERVAL);
+        }, FIRST_RUN_DELAY);
+    } else {
+        console.log('[scheduler] retención deshabilitada (WFML_RETENTION_ENABLED=0)');
+    }
+
+    // Loop 6 — janitor de jobs zombie.
     if (ZOMBIE_ENABLED) {
         console.log(`[scheduler] zombie reclaim — chequeo cada ${Math.round(ZOMBIE_CHECK_INTERVAL / 1000)}s, timeout ${ZOMBIE_TIMEOUT_MIN}min`);
         setTimeout(() => {

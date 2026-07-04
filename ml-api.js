@@ -127,19 +127,22 @@ export async function refreshAccessToken(account) {
 /**
  * GET genérico a la API de ML con bearer token. Reintenta 1 vez si recibe 401
  * (refrescando el token). Devuelve { ok, status, data }.
+ *
+ * @param {object|null} extraHeaders headers adicionales (ej. { 'x-version': '2' }
+ *   para billing_info) — se suman a los base sin pisarse el Authorization.
  */
-export async function mlGet(account, path, accessToken, _isRetry = false) {
+export async function mlGet(account, path, accessToken, _isRetry = false, extraHeaders = null) {
     const url = path.startsWith('http') ? path : `${ML_API}${path}`;
-    const resp = await fetch(url, {
-        headers: {
-            'Accept': 'application/json',
-            'Authorization': `Bearer ${accessToken}`,
-        },
-    });
+    const headers = {
+        'Accept': 'application/json',
+        'Authorization': `Bearer ${accessToken}`,
+    };
+    if (extraHeaders && typeof extraHeaders === 'object') Object.assign(headers, extraHeaders);
+    const resp = await fetch(url, { headers });
     if (resp.status === 401 && !_isRetry) {
         // Token venció antes de tiempo — refrescar y reintentar una vez.
         const fresh = await refreshAccessToken(account);
-        return mlGet(account, path, fresh, true);
+        return mlGet(account, path, fresh, true, extraHeaders);
     }
     const raw = await resp.text();
     let data;
@@ -182,6 +185,84 @@ export async function mlGetOrder(account, accessToken, orderId) {
         throw new Error(`orders/${orderId} falló: HTTP ${r.status}`);
     }
     return r.data;
+}
+
+/**
+ * Datos fiscales del comprador de una orden (Ventas ML, F0).
+ *   GET /orders/{id}/billing_info  (header x-version: 2 → shape enriquecido
+ *   con nombre/razón social, doc_type/doc_number, taxes)
+ *
+ * DNI/CUIT del receptor: clave para facturar por ARCA desde el espejo. No
+ * toda orden lo tiene (depende del sitio/comprador) — el caller debe tolerar
+ * el throw y seguir sin billing.
+ *
+ * @returns {Promise<object>} el JSON crudo de billing_info
+ */
+export async function mlGetOrderBillingInfo(account, accessToken, orderId) {
+    const r = await mlGet(
+        account,
+        `/orders/${encodeURIComponent(orderId)}/billing_info`,
+        accessToken,
+        false,
+        { 'x-version': '2' }
+    );
+    if (!r.ok || !r.data) {
+        throw new Error(`orders/${orderId}/billing_info falló: HTTP ${r.status}`);
+    }
+    return r.data;
+}
+
+/**
+ * Estado del envío de una orden (Ventas ML, F0).
+ *   GET /shipments/{id}  (header x-format-new: true → formato nuevo)
+ *
+ * La orden ML solo trae shipping.id; el estado real (preparando / en camino /
+ * entregado) y el tracking viven acá.
+ *
+ * @returns {Promise<object>} el JSON crudo del shipment
+ */
+export async function mlGetShipment(account, accessToken, shipmentId) {
+    const r = await mlGet(
+        account,
+        `/shipments/${encodeURIComponent(shipmentId)}`,
+        accessToken,
+        false,
+        { 'x-format-new': 'true' }
+    );
+    if (!r.ok || !r.data) {
+        throw new Error(`shipments/${shipmentId} falló: HTTP ${r.status}`);
+    }
+    return r.data;
+}
+
+/**
+ * Búsqueda de órdenes del seller, paginada (backfill de Ventas ML).
+ *   GET /orders/search?seller={uid}&order.date_created.from=&sort=date_desc...
+ *
+ * Los results vienen con la orden bastante completa (status, order_items,
+ * payments, buyer, totales); billing_info y shipment siguen siendo llamadas
+ * aparte por orden.
+ *
+ * @param {object} range { from?, to?, offset?, limit?, sort? } — fechas en el
+ *   formato ISO de ML (ej. '2025-07-03T00:00:00.000-00:00').
+ * @returns {Promise<{ results: object[], total: number }>}
+ */
+export async function mlSearchOrders(account, accessToken, range = {}) {
+    const uid    = Number(account.ml_user_id);
+    const offset = Math.max(0, Number(range.offset) || 0);
+    const limit  = Math.min(50, Math.max(1, Number(range.limit) || 50));
+    const sort   = String(range.sort || 'date_desc');
+    let path = `/orders/search?seller=${uid}&offset=${offset}&limit=${limit}&sort=${encodeURIComponent(sort)}`;
+    if (range.from) path += `&order.date_created.from=${encodeURIComponent(range.from)}`;
+    if (range.to)   path += `&order.date_created.to=${encodeURIComponent(range.to)}`;
+    const r = await mlGet(account, path, accessToken);
+    if (!r.ok || !r.data) {
+        throw new Error(`orders/search falló: HTTP ${r.status} ${(r.data && r.data.message) || ''}`);
+    }
+    return {
+        results: Array.isArray(r.data.results) ? r.data.results : [],
+        total:   Number(r.data.paging && r.data.paging.total) || 0,
+    };
 }
 
 /**

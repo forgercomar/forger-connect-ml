@@ -13,7 +13,15 @@
  *   GET  /v1/jobs/:job_id       → status + progress. Auth: cuenta.
  *   POST /v1/jobs/:job_id/next-batch → siguiente step (o "done"). Auth: cuenta.
  *   POST /v1/jobs/:job_id/report     → resultado de un step. Auth: cuenta.
+ *   GET  /v1/jobs/:job_id/results    → items sincronizados (paginado). Auth: cuenta.
+ *   POST /v1/jobs/:job_id/ack        → marca resultados como entregados. Auth: cuenta.
  *   POST /v1/jobs/:job_id/cancel     → aborta el job. Auth: cuenta.
+ *   GET  /v1/sync/pending       → jobs de sync con resultados sin bajar. Auth: cuenta.
+ *   GET  /v1/orders/pending     → órdenes sin aplicar (payload v2: orden completa
+ *                                 + billing + shipment desde order_snapshots). Auth: cuenta.
+ *   POST /v1/orders/ack         → marca órdenes como aplicadas. Auth: cuenta.
+ *   POST /v1/orders/backfill    → job de importación histórica (Ventas ML). Auth: cuenta.
+ *   GET  /v1/orders/history     → pagina los snapshots completos. Auth: cuenta.
  *
  * Convenciones:
  *   - Toda fecha sale como ISO8601 UTC.
@@ -968,27 +976,47 @@ export function mountV1(app, opts = {}) {
     // reciente procesada, porque una orden puede generar varios webhooks. El
     // plugin descuenta/repone stock según el status.
     //
+    // payload v2 (Ventas ML, F0): cada orden suma `order` (la orden ML
+    // completa), `billing` (billing_info del comprador) y `shipment` (estado
+    // del envío) desde order_snapshots — pueden ser null si el snapshot aún no
+    // existe o el enriquecimiento falló. Compat: el shape v1 (ml_order_id /
+    // status / items) se conserva TAL CUAL y los plugins viejos ignoran las
+    // claves nuevas (verificado contra wf-ml-stock.php 1.6.5). LIMIT 200 para
+    // acotar la respuesta (los snapshots pesan); lo que no entra sale en el
+    // próximo drenado.
+    //
     // Respuesta:
-    //   { ok: true, orders: [{ ml_order_id, status, items: [...] }] }
+    //   { ok: true, payload_version: 2,
+    //     orders: [{ ml_order_id, status, items: [...],
+    //                order, billing, shipment, snapshot_at }] }
     // -------------------------------------------------------------------------
     app.get(p('/v1/orders/pending'), authAccount, async (req, res) => {
         const r = await query(
-            `SELECT DISTINCT ON (ml_order_id)
-                    ml_order_id, order_status, items_json
-             FROM order_events
-             WHERE account_id = $1
-               AND processed_at IS NOT NULL
-               AND delivered_at IS NULL
-               AND error IS NULL
-             ORDER BY ml_order_id, processed_at DESC`,
+            `SELECT DISTINCT ON (e.ml_order_id)
+                    e.ml_order_id, e.order_status, e.items_json,
+                    s.order_json, s.billing_json, s.shipment_json,
+                    s.updated_at AS snapshot_at
+             FROM order_events e
+             LEFT JOIN order_snapshots s
+                    ON s.account_id = e.account_id AND s.ml_order_id = e.ml_order_id
+             WHERE e.account_id = $1
+               AND e.processed_at IS NOT NULL
+               AND e.delivered_at IS NULL
+               AND e.error IS NULL
+             ORDER BY e.ml_order_id, e.processed_at DESC
+             LIMIT 200`,
             [req.account.id]
         );
         const orders = r.rows.map((row) => ({
             ml_order_id: row.ml_order_id,
             status:      row.order_status,
             items:       Array.isArray(row.items_json) ? row.items_json : [],
+            order:       row.order_json || null,
+            billing:     row.billing_json || null,
+            shipment:    row.shipment_json || null,
+            snapshot_at: row.snapshot_at || null,
         }));
-        return res.json({ ok: true, orders });
+        return res.json({ ok: true, payload_version: 2, orders });
     });
 
     // -------------------------------------------------------------------------
@@ -1008,6 +1036,89 @@ export function mountV1(app, opts = {}) {
             [req.account.id, ids]
         );
         return res.json({ ok: true, marked: r.rowCount });
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /v1/orders/backfill  (Ventas ML, F0)
+    // Body: { months?: number }  (1..24, default 12)
+    //
+    // Importa el historial de órdenes ML de la cuenta a order_snapshots. Crea
+    // un job 'orders_backfill' que procesa el SCHEDULER en su propio loop (no
+    // compite con el worker de sync/push). El plugin pollea el avance con
+    // GET /v1/jobs/:job_id y después pagina GET /v1/orders/history.
+    //
+    // Idempotente: si ya hay un backfill pending/running para la cuenta,
+    // devuelve ESE job (already: true) en vez de encolar otro. Re-correrlo
+    // cuando terminó es inofensivo (upsert por orden).
+    //
+    // Respuesta: { ok, job_id, status, months? , already?: true }
+    // -------------------------------------------------------------------------
+    app.post(p('/v1/orders/backfill'), authAccount, async (req, res) => {
+        const months = Math.min(24, Math.max(1, Number(req.body && req.body.months) || 12));
+        try {
+            const act = await query(
+                `SELECT public_id, status FROM jobs
+                 WHERE account_id = $1 AND type = 'orders_backfill'
+                   AND status IN ('pending','running')
+                 ORDER BY created_at DESC LIMIT 1`,
+                [req.account.id]
+            );
+            if (act.rowCount) {
+                return res.json({ ok: true, job_id: act.rows[0].public_id, status: act.rows[0].status, already: true });
+            }
+            const jobPublic = generatePublicId('job');
+            await query(
+                `INSERT INTO jobs (public_id, account_id, type, status, input, steps_total)
+                 VALUES ($1, $2, 'orders_backfill', 'pending', $3, 0)`,
+                [jobPublic, req.account.id, JSON.stringify({ months, source: 'plugin' })]
+            );
+            return res.json({ ok: true, job_id: jobPublic, status: 'pending', months });
+        } catch (err) {
+            console.error('[v1/orders/backfill] error:', err);
+            return res.status(500).json({ ok: false, error: 'db_error', message: err.message });
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /v1/orders/history?offset=&limit=  (Ventas ML, F0)
+    //
+    // Pagina los snapshots completos de órdenes de la cuenta (backfill + los
+    // que dejó el pipeline en vivo), de la más nueva a la más vieja. El plugin
+    // los ingesta al espejo wf_orders con upsert idempotente — no hay ack: el
+    // cliente lleva su propio offset y re-bajar una página repetida no duplica.
+    //
+    // Respuesta:
+    //   { ok, payload_version: 2, total, offset, limit,
+    //     orders: [{ ml_order_id, order, billing, shipment, snapshot_at }] }
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/orders/history'), authAccount, async (req, res) => {
+        const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 50));
+        const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+        try {
+            const r = await query(
+                `SELECT ml_order_id, order_json, billing_json, shipment_json, updated_at
+                 FROM order_snapshots
+                 WHERE account_id = $1
+                 ORDER BY ml_date_created DESC NULLS LAST, id DESC
+                 LIMIT $2 OFFSET $3`,
+                [req.account.id, limit, offset]
+            );
+            const c = await query(
+                `SELECT COUNT(*)::int AS n FROM order_snapshots WHERE account_id = $1`,
+                [req.account.id]
+            );
+            const orders = r.rows.map((row) => ({
+                ml_order_id: row.ml_order_id,
+                order:       row.order_json || null,
+                billing:     row.billing_json || null,
+                shipment:    row.shipment_json || null,
+                snapshot_at: row.updated_at,
+            }));
+            return res.json({ ok: true, payload_version: 2, total: c.rows[0].n, offset, limit, orders });
+        } catch (err) {
+            console.error('[v1/orders/history] error:', err);
+            return res.status(500).json({ ok: false, error: 'db_error', message: err.message });
+        }
     });
 
     // -------------------------------------------------------------------------
