@@ -40,6 +40,7 @@ import {
     openSecret,
 } from './auth.js';
 import { verifyCapabilityToken } from './license-token.js';
+import { getValidAccessToken, mlGetShipmentLabel } from './ml-api.js';
 
 // Header donde el satélite ML manda el capability-token de licencia (Fase 6).
 // (El central TN usa X-Wftn-License-Token con este MISMO archivo copiado.)
@@ -1118,6 +1119,53 @@ export function mountV1(app, opts = {}) {
         } catch (err) {
             console.error('[v1/orders/history] error:', err);
             return res.status(500).json({ ok: false, error: 'db_error', message: err.message });
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /v1/orders/label?ml_order_id=  (Mercado Envíos, P2)
+    //
+    // Proxy EN CALIENTE de la etiqueta de envío: busca el shipment de la orden
+    // en el snapshot, pide el PDF a ML con el token de la cuenta y lo devuelve
+    // en base64. No se persiste nada (la etiqueta es un artefacto de imprenta).
+    //
+    // Respuesta: { ok, pdf_b64 } · 404 sin snapshot/envío · 502 si ML no la dio
+    // (envío Full, ya despachado, o todavía no imprimible).
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/orders/label'), authAccount, async (req, res) => {
+        const mlOrderId = String(req.query.ml_order_id || '').trim();
+        if (!mlOrderId) {
+            return res.status(400).json({ ok: false, error: 'bad_request', message: 'Falta ml_order_id.' });
+        }
+        try {
+            const r = await query(
+                `SELECT shipment_id, order_json FROM order_snapshots
+                 WHERE account_id = $1 AND ml_order_id = $2 LIMIT 1`,
+                [req.account.id, mlOrderId]
+            );
+            if (!r.rowCount) {
+                return res.status(404).json({ ok: false, error: 'not_found', message: 'La orden no está en el snapshot.' });
+            }
+            let shipmentId = r.rows[0].shipment_id ? String(r.rows[0].shipment_id) : '';
+            if (!shipmentId) {
+                const oj = r.rows[0].order_json || {};
+                const raw = oj && oj.shipping && oj.shipping.id != null ? String(oj.shipping.id) : '';
+                if (/^\d+$/.test(raw)) shipmentId = raw;
+            }
+            if (!shipmentId) {
+                return res.status(404).json({ ok: false, error: 'no_shipment', message: 'La orden no tiene envío de Mercado Envíos.' });
+            }
+            const token = await getValidAccessToken(req.account);
+            const pdf = await mlGetShipmentLabel(req.account, token, shipmentId);
+            // Solo PDF de verdad: un 200 de ML con JSON/ZPL adentro no debe
+            // llegar al operador como archivo corrupto (review P2).
+            if (pdf.length < 5 || pdf.subarray(0, 4).toString() !== '%PDF') {
+                return res.status(502).json({ ok: false, error: 'label_not_pdf', message: 'Mercado Libre no entregó la etiqueta en PDF todavía — probá de nuevo en unos minutos.' });
+            }
+            return res.json({ ok: true, pdf_b64: pdf.toString('base64') });
+        } catch (err) {
+            console.error('[v1/orders/label] error:', err.message);
+            return res.status(502).json({ ok: false, error: 'label_unavailable', message: 'Mercado Libre no entregó la etiqueta (¿envío Full, ya despachado o aún no imprimible?).' });
         }
     });
 

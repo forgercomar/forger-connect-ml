@@ -63,20 +63,26 @@ export async function enrichOrder(account, token, order, opts = {}) {
 export async function upsertOrderSnapshot(accountId, order, enrich = {}) {
     const mlOrderId = String(order.id);
     const dc = order.date_created ? new Date(order.date_created) : null;
+    // shipment_id denormalizado (009): resuelve "webhook de shipments → orden"
+    // y la búsqueda del envío para la etiqueta, sin escanear JSON.
+    const shipRaw = order && order.shipping && order.shipping.id != null ? String(order.shipping.id) : '';
+    const shipmentId = /^\d+$/.test(shipRaw) ? shipRaw : null;
     await query(
         `INSERT INTO order_snapshots
-             (account_id, ml_order_id, order_json, billing_json, shipment_json, ml_date_created)
-         VALUES ($1, $2, $3, $4, $5, $6)
+             (account_id, ml_order_id, order_json, billing_json, shipment_json, ml_date_created, shipment_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (account_id, ml_order_id) DO UPDATE SET
              order_json      = EXCLUDED.order_json,
              billing_json    = COALESCE(EXCLUDED.billing_json,  order_snapshots.billing_json),
              shipment_json   = COALESCE(EXCLUDED.shipment_json, order_snapshots.shipment_json),
              ml_date_created = COALESCE(EXCLUDED.ml_date_created, order_snapshots.ml_date_created),
+             shipment_id     = COALESCE(EXCLUDED.shipment_id, order_snapshots.shipment_id),
              updated_at      = NOW()`,
         [accountId, mlOrderId,
          JSON.stringify(order),
          enrich.billing != null ? JSON.stringify(enrich.billing) : null,
          enrich.shipment != null ? JSON.stringify(enrich.shipment) : null,
-         dc && !Number.isNaN(dc.getTime()) ? dc.toISOString() : null]
+         dc && !Number.isNaN(dc.getTime()) ? dc.toISOString() : null,
+         shipmentId]
     );
 }

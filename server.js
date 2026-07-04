@@ -1877,8 +1877,9 @@ app.post('/connect-mp/refresh-token', limitMpFinishRefresh, async (req, res) => 
 // ML hace retry agresivo si no respondemos 200 en pocos segundos: respondemos
 // ANTES de cualquier procesamiento.
 // ============================================================================
-const WEBHOOK_ITEM_TOPICS  = new Set(['items', 'items_prices']);
-const WEBHOOK_ORDER_TOPICS = new Set(['orders_v2', 'orders']);
+const WEBHOOK_ITEM_TOPICS     = new Set(['items', 'items_prices']);
+const WEBHOOK_ORDER_TOPICS    = new Set(['orders_v2', 'orders']);
+const WEBHOOK_SHIPMENT_TOPICS = new Set(['shipments']); // Mercado Envíos (P2): frescura de estados
 
 // Hardening #26 (2026-05-25): el endpoint /webhooks es necesariamente público
 // (ML manda POSTs desde sus servidores, sin auth header — ML no firma webhooks).
@@ -1941,17 +1942,21 @@ app.post(['/connect-ml/webhooks', '/webhooks'], limitWebhooks, (req, res) => {
         webhookSeen.set(wId, Date.now() + WEBHOOK_SEEN_TTL_MS);
     }
 
-    const isItem  = WEBHOOK_ITEM_TOPICS.has(topic);
-    const isOrder = WEBHOOK_ORDER_TOPICS.has(topic);
-    if (!isItem && !isOrder) {
-        // messages, shipments, claims, etc. — fuera del scope actual.
+    const isItem     = WEBHOOK_ITEM_TOPICS.has(topic);
+    const isOrder    = WEBHOOK_ORDER_TOPICS.has(topic);
+    const isShipment = WEBHOOK_SHIPMENT_TOPICS.has(topic);
+    if (!isItem && !isOrder && !isShipment) {
+        // messages, claims, etc. — fuera del scope actual.
         return;
     }
 
-    // Extraer el id del recurso: "/items/MLA123[/prices]" o "/orders/123".
+    // Extraer el id del recurso: "/items/MLA123[/prices]", "/orders/123" o "/shipments/123".
     let resourceId = '';
     if (isItem) {
         const m = resource.match(/\/items\/([A-Za-z0-9]+)/);
+        resourceId = m ? m[1] : '';
+    } else if (isShipment) {
+        const m = resource.match(/\/shipments\/(\d+)/);
         resourceId = m ? m[1] : '';
     } else {
         const m = resource.match(/\/orders\/(\d+)/);
@@ -1980,6 +1985,26 @@ app.post(['/connect-ml/webhooks', '/webhooks'], limitWebhooks, (req, res) => {
                      VALUES ($1, $2, $3)`,
                     [accountId, resourceId, topic]
                 );
+            } else if (isShipment) {
+                // Mercado Envíos (P2): un cambio de ENVÍO no webhookea la orden.
+                // Resolver shipment → órdenes por el snapshot (columna 009) y
+                // encolar un order_event por CADA una: las compras de carrito
+                // (pack) comparten un shipment entre varias órdenes hermanas —
+                // el pipeline normal re-trae cada orden, re-enrichea el
+                // shipment y re-entrega al plugin (pill y tablero frescos).
+                const snap = await dbQuery(
+                    `SELECT ml_order_id FROM order_snapshots
+                     WHERE account_id = $1 AND shipment_id = $2`,
+                    [accountId, Number(resourceId)]
+                );
+                if (!snap.rowCount) return; // envío de una orden que aún no vimos → la traerá su webhook de orden
+                for (const row of snap.rows) {
+                    await dbQuery(
+                        `INSERT INTO order_events (account_id, ml_order_id)
+                         VALUES ($1, $2)`,
+                        [accountId, row.ml_order_id]
+                    );
+                }
             } else {
                 await dbQuery(
                     `INSERT INTO order_events (account_id, ml_order_id)

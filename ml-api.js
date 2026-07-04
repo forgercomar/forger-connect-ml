@@ -151,6 +151,48 @@ export async function mlGet(account, path, accessToken, _isRetry = false, extraH
 }
 
 /**
+ * GET BINARIO a la API de ML (PDF/ZPL de etiquetas): mismo contrato que mlGet
+ * pero devuelve el cuerpo como Buffer sin intentar JSON.parse. Reintenta 1 vez
+ * ante 401 refrescando el token.
+ *
+ * @returns {Promise<{ ok: boolean, status: number, buf: Buffer, contentType: string }>}
+ */
+export async function mlGetRaw(account, path, accessToken, _isRetry = false, extraHeaders = null) {
+    const url = path.startsWith('http') ? path : `${ML_API}${path}`;
+    const headers = { 'Authorization': `Bearer ${accessToken}` };
+    if (extraHeaders && typeof extraHeaders === 'object') Object.assign(headers, extraHeaders);
+    const resp = await fetch(url, { headers });
+    if (resp.status === 401 && !_isRetry) {
+        const fresh = await refreshAccessToken(account);
+        return mlGetRaw(account, path, fresh, true, extraHeaders);
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    return { ok: resp.ok, status: resp.status, buf, contentType: String(resp.headers.get('content-type') || '') };
+}
+
+/**
+ * Etiqueta de Mercado Envíos en PDF (Mercado Envíos, P2).
+ *   GET /shipment_labels?shipment_ids={id}&response_type=pdf
+ *
+ * Solo existe para envíos que despacha el VENDEDOR (self_service/xd_drop_off)
+ * y en estados imprimibles (ready_to_ship) — fuera de eso ML responde 4xx y
+ * el caller debe traducirlo a "todavía no disponible".
+ *
+ * @returns {Promise<Buffer>} el PDF crudo
+ */
+export async function mlGetShipmentLabel(account, accessToken, shipmentId) {
+    const r = await mlGetRaw(
+        account,
+        `/shipment_labels?shipment_ids=${encodeURIComponent(String(shipmentId))}&response_type=pdf`,
+        accessToken
+    );
+    if (!r.ok || !r.buf || !r.buf.length) {
+        throw new Error(`shipment_labels ${shipmentId}: HTTP ${r.status}`);
+    }
+    return r.buf;
+}
+
+/**
  * Lista los IDs de items del seller, paginado.
  *   GET /users/{uid}/items/search?offset=&limit=[&orders=]
  *
