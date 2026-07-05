@@ -49,7 +49,7 @@
 
 import { query } from './db.js';
 import { generatePublicId } from './auth.js';
-import { getValidAccessToken, mlGetOrder, mlSearchOrders } from './ml-api.js';
+import { getValidAccessToken, mlGetOrder, mlSearchOrders, mlGetMessage, mlGetQuestion } from './ml-api.js';
 import { enrichOrder, upsertOrderSnapshot } from './orders-snapshot.js';
 
 const AUTOSYNC_ENABLED = process.env.WFML_AUTOSYNC_ENABLED !== '0';
@@ -64,6 +64,9 @@ const WEBHOOK_BATCH_INTERVAL = Math.max(15000, Number(process.env.WFML_WEBHOOK_B
 
 const ORDER_ENABLED  = process.env.WFML_ORDER_ENABLED !== '0';
 const ORDER_INTERVAL = Math.max(15000, Number(process.env.WFML_ORDER_INTERVAL) || 60000);
+// Mensajería + Preguntas (M0, v2.9.0): mismo modelo que las órdenes.
+const MSG_ENABLED    = process.env.WFML_MSG_ENABLED !== '0';
+const MSG_INTERVAL   = Math.max(15000, Number(process.env.WFML_MSG_INTERVAL) || 60000);
 
 // Backfill histórico de órdenes (Ventas ML, F0): procesa jobs 'orders_backfill'
 // en su propio loop — NO en el worker, para que un backfill de miles de órdenes
@@ -106,6 +109,8 @@ const FIRST_RUN_DELAY = 30000;
 let _busy = false;
 let _webhookBusy = false;
 let _orderBusy = false;
+let _msgBusy = false;
+let _questionBusy = false;
 let _zombieBusy = false;
 let _backfillBusy = false;
 let _retentionBusy = false;
@@ -368,6 +373,138 @@ async function orderTick() {
 }
 
 // ----------------------------------------------------------------------------
+// Mensajería post-venta + Preguntas pre-venta (M0, v2.9.0)
+//
+// Mismo modelo que las órdenes: el webhook encola solo el id; estos ticks
+// bajan el CONTENIDO de ML con el token custodiado y dejan el payload CRUDO
+// en la cola para que el plugin lo baje con ack. El central NO conserva
+// conversaciones (decisión del dueño 2026-07-05): es cola de tránsito y la
+// retención purga lo entregado — el historial vivo queda en el WP del cliente.
+// ----------------------------------------------------------------------------
+
+async function processMessageEvents() {
+    const pend = await query(
+        `SELECT id, account_id, ml_message_id
+         FROM message_events
+         WHERE processed_at IS NULL
+         ORDER BY account_id, id
+         LIMIT 200`
+    );
+    if (!pend.rowCount) return 0;
+    // Agrupar por cuenta; dedup por mensaje (ML puede webhookear repetido).
+    const byAccount = new Map();
+    for (const row of pend.rows) {
+        let msgs = byAccount.get(row.account_id);
+        if (!msgs) { msgs = new Map(); byAccount.set(row.account_id, msgs); }
+        let evIds = msgs.get(row.ml_message_id);
+        if (!evIds) { evIds = []; msgs.set(row.ml_message_id, evIds); }
+        evIds.push(row.id);
+    }
+    let processed = 0;
+    for (const [accountId, msgs] of byAccount) {
+        let account, token;
+        try {
+            const accR = await query(`SELECT * FROM accounts WHERE id = $1`, [accountId]);
+            if (!accR.rowCount || accR.rows[0].revoked_at) continue;
+            account = accR.rows[0];
+            token = await getValidAccessToken(account);
+        } catch (err) {
+            console.error(`[scheduler] mensajes: cuenta ${accountId} sin token — se reintenta:`, err.message);
+            continue;
+        }
+        for (const [mlMessageId, evIds] of msgs) {
+            try {
+                const msg = await mlGetMessage(account, token, mlMessageId);
+                await query(
+                    `UPDATE message_events
+                     SET processed_at = NOW(), payload_json = $2, error = NULL
+                     WHERE id = ANY($1::bigint[])`,
+                    [evIds, JSON.stringify(msg)]
+                );
+                processed++;
+            } catch (err) {
+                // No se marca processed_at → se reintenta el próximo tick.
+                console.error(`[scheduler] mensaje ${mlMessageId} falló (se reintenta):`, err.message);
+            }
+        }
+    }
+    return processed;
+}
+
+async function messageTick() {
+    if (_msgBusy) return;
+    _msgBusy = true;
+    try {
+        const n = await processMessageEvents();
+        if (n > 0) console.log(`[scheduler] ${n} mensaje(s) procesado(s)`);
+    } catch (err) {
+        console.error('[scheduler] message tick error:', err.message);
+    } finally {
+        _msgBusy = false;
+    }
+}
+
+async function processQuestionEvents() {
+    const pend = await query(
+        `SELECT id, account_id, ml_question_id
+         FROM question_events
+         WHERE processed_at IS NULL
+         ORDER BY account_id, id
+         LIMIT 200`
+    );
+    if (!pend.rowCount) return 0;
+    const byAccount = new Map();
+    for (const row of pend.rows) {
+        let qs = byAccount.get(row.account_id);
+        if (!qs) { qs = new Map(); byAccount.set(row.account_id, qs); }
+        let evIds = qs.get(row.ml_question_id);
+        if (!evIds) { evIds = []; qs.set(row.ml_question_id, evIds); }
+        evIds.push(row.id);
+    }
+    let processed = 0;
+    for (const [accountId, qs] of byAccount) {
+        let account, token;
+        try {
+            const accR = await query(`SELECT * FROM accounts WHERE id = $1`, [accountId]);
+            if (!accR.rowCount || accR.rows[0].revoked_at) continue;
+            account = accR.rows[0];
+            token = await getValidAccessToken(account);
+        } catch (err) {
+            console.error(`[scheduler] preguntas: cuenta ${accountId} sin token — se reintenta:`, err.message);
+            continue;
+        }
+        for (const [mlQuestionId, evIds] of qs) {
+            try {
+                const q = await mlGetQuestion(account, token, mlQuestionId);
+                await query(
+                    `UPDATE question_events
+                     SET processed_at = NOW(), payload_json = $2, error = NULL
+                     WHERE id = ANY($1::bigint[])`,
+                    [evIds, JSON.stringify(q)]
+                );
+                processed++;
+            } catch (err) {
+                console.error(`[scheduler] pregunta ${mlQuestionId} falló (se reintenta):`, err.message);
+            }
+        }
+    }
+    return processed;
+}
+
+async function questionTick() {
+    if (_questionBusy) return;
+    _questionBusy = true;
+    try {
+        const n = await processQuestionEvents();
+        if (n > 0) console.log(`[scheduler] ${n} pregunta(s) procesada(s)`);
+    } catch (err) {
+        console.error('[scheduler] question tick error:', err.message);
+    } finally {
+        _questionBusy = false;
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Backfill histórico de órdenes (Ventas ML, F0)
 // ----------------------------------------------------------------------------
 
@@ -548,6 +685,18 @@ async function purgeDeliveredRows() {
              SELECT id FROM webhook_events
              WHERE processed_at IS NOT NULL AND processed_at < NOW() - ($1 || ' days')::interval
              LIMIT 5000)`],
+        // Mensajería/Preguntas (M0): el central es cola de tránsito — lo
+        // entregado se purga; las conversaciones viven en el WP del cliente.
+        ['message_events',
+         `DELETE FROM message_events WHERE id IN (
+             SELECT id FROM message_events
+             WHERE delivered_at IS NOT NULL AND delivered_at < NOW() - ($1 || ' days')::interval
+             LIMIT 5000)`],
+        ['question_events',
+         `DELETE FROM question_events WHERE id IN (
+             SELECT id FROM question_events
+             WHERE delivered_at IS NOT NULL AND delivered_at < NOW() - ($1 || ' days')::interval
+             LIMIT 5000)`],
     ];
     for (const [name, sql] of targets) {
         const r = await query(sql, [String(RETENTION_DAYS)]);
@@ -680,6 +829,19 @@ export function startScheduler() {
         }, FIRST_RUN_DELAY);
     } else {
         console.log('[scheduler] retención deshabilitada (WFML_RETENTION_ENABLED=0)');
+    }
+
+    // Loop 7 — mensajería + preguntas (M0, v2.9.0).
+    if (MSG_ENABLED) {
+        console.log(`[scheduler] mensajería/preguntas — cada ${Math.round(MSG_INTERVAL / 1000)}s`);
+        setTimeout(() => {
+            messageTick().catch((e) => console.error('[scheduler] first message tick uncaught:', e));
+            questionTick().catch((e) => console.error('[scheduler] first question tick uncaught:', e));
+            setInterval(() => { messageTick().catch((e) => console.error('[scheduler] message tick uncaught:', e)); }, MSG_INTERVAL);
+            setInterval(() => { questionTick().catch((e) => console.error('[scheduler] question tick uncaught:', e)); }, MSG_INTERVAL);
+        }, FIRST_RUN_DELAY);
+    } else {
+        console.log('[scheduler] mensajería/preguntas deshabilitado (WFML_MSG_ENABLED=0)');
     }
 
     // Loop 6 — janitor de jobs zombie.

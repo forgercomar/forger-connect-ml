@@ -366,3 +366,118 @@ export async function mlGetItems(account, accessToken, ids) {
     }
     return out;
 }
+
+// ----------------------------------------------------------------------------
+// Mensajería post-venta + Preguntas pre-venta (M0, v2.9.0)
+// ----------------------------------------------------------------------------
+
+/**
+ * POST genérico a la API de ML con bearer token. Reintenta 1 vez ante 401
+ * (refrescando el token). Mismo contrato de retorno que mlUpdateItem.
+ *
+ * @returns {Promise<{ ok: boolean, status: number, data: object|null }>}
+ */
+export async function mlPost(account, path, accessToken, body, _isRetry = false) {
+    const url = path.startsWith('http') ? path : `${ML_API}${path}`;
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify(body || {}),
+    });
+    if (resp.status === 401 && !_isRetry) {
+        const fresh = await refreshAccessToken(account);
+        return mlPost(account, path, fresh, body, true);
+    }
+    const raw = await resp.text();
+    let data;
+    try { data = JSON.parse(raw); } catch (_) { data = null; }
+    return { ok: resp.ok, status: resp.status, data };
+}
+
+/**
+ * Un MENSAJE puntual de la mensajería post-venta (el webhook `messages` trae
+ * el resource /messages/{id}). Devuelve el mensaje crudo de ML — el shape trae
+ * from/to, text, message_resources (pack/orden), message_date.
+ */
+export async function mlGetMessage(account, accessToken, messageId) {
+    const r = await mlGet(account, `/messages/${encodeURIComponent(messageId)}?tag=post_sale`, accessToken);
+    if (!r.ok || !r.data) {
+        throw new Error(`messages/${messageId} falló: HTTP ${r.status}`);
+    }
+    return r.data;
+}
+
+/**
+ * Hilo COMPLETO de mensajes de un pack (conversación comprador↔vendedor).
+ *   GET /messages/packs/{pack_id}/sellers/{seller_id}?tag=post_sale
+ * mark_as_read=false: leer el hilo desde el sistema NO lo marca leído en ML
+ * (el estado de lectura del operador vive en el WP del cliente).
+ */
+export async function mlGetPackMessages(account, accessToken, packId, offset = 0, limit = 40) {
+    const uid  = Number(account.ml_user_id);
+    const path = `/messages/packs/${encodeURIComponent(String(packId))}/sellers/${uid}`
+               + `?tag=post_sale&mark_as_read=false&offset=${offset}&limit=${limit}`;
+    const r = await mlGet(account, path, accessToken);
+    if (!r.ok || !r.data) {
+        throw new Error(`messages/packs/${packId} falló: HTTP ${r.status}`);
+    }
+    return r.data; // { paging, messages: [...], conversation_status }
+}
+
+/**
+ * RESPONDER al comprador en el hilo de un pack.
+ *   POST /messages/packs/{pack_id}/sellers/{seller_id}?tag=post_sale
+ * ML exige from (seller) y to (buyer) explícitos.
+ */
+export async function mlSendPackMessage(account, accessToken, packId, buyerUserId, text) {
+    const uid  = Number(account.ml_user_id);
+    const path = `/messages/packs/${encodeURIComponent(String(packId))}/sellers/${uid}?tag=post_sale`;
+    return mlPost(account, path, accessToken, {
+        from: { user_id: uid },
+        to:   { user_id: Number(buyerUserId) },
+        text: String(text || ''),
+    });
+}
+
+/**
+ * Preguntas del seller (pre-venta), paginado.
+ *   GET /questions/search?seller_id=&status=&offset=&limit=&api_version=4
+ * status típico: 'UNANSWERED' (para el backfill de abiertas) o vacío (todas).
+ */
+export async function mlSearchQuestions(account, accessToken, { status = '', offset = 0, limit = 50 } = {}) {
+    const uid  = Number(account.ml_user_id);
+    let path = `/questions/search?seller_id=${uid}&offset=${offset}&limit=${limit}&api_version=4&sort_fields=date_created&sort_types=DESC`;
+    if (status) path += `&status=${encodeURIComponent(status)}`;
+    const r = await mlGet(account, path, accessToken);
+    if (!r.ok || !r.data) {
+        throw new Error(`questions/search falló: HTTP ${r.status}`);
+    }
+    return {
+        questions: Array.isArray(r.data.questions) ? r.data.questions : [],
+        total:     Number(r.data.total) || 0,
+    };
+}
+
+/** Una pregunta puntual (el webhook `questions` trae el resource /questions/{id}). */
+export async function mlGetQuestion(account, accessToken, questionId) {
+    const r = await mlGet(account, `/questions/${encodeURIComponent(String(questionId))}?api_version=4`, accessToken);
+    if (!r.ok || !r.data) {
+        throw new Error(`questions/${questionId} falló: HTTP ${r.status}`);
+    }
+    return r.data; // { id, text, status, item_id, from, answer, date_created }
+}
+
+/**
+ * RESPONDER una pregunta.
+ *   POST /answers  body { question_id, text }
+ */
+export async function mlAnswerQuestion(account, accessToken, questionId, text) {
+    return mlPost(account, '/answers', accessToken, {
+        question_id: Number(questionId),
+        text: String(text || ''),
+    });
+}

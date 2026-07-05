@@ -40,7 +40,7 @@ import {
     openSecret,
 } from './auth.js';
 import { verifyCapabilityToken } from './license-token.js';
-import { getValidAccessToken, mlGetShipmentLabel } from './ml-api.js';
+import { getValidAccessToken, mlGetShipmentLabel, mlGetPackMessages, mlSendPackMessage, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
 
 // Header donde el satélite ML manda el capability-token de licencia (Fase 6).
 // (El central TN usa X-Wftn-License-Token con este MISMO archivo copiado.)
@@ -1166,6 +1166,205 @@ export function mountV1(app, opts = {}) {
         } catch (err) {
             console.error('[v1/orders/label] error:', err.message);
             return res.status(502).json({ ok: false, error: 'label_unavailable', message: 'Mercado Libre no entregó la etiqueta (¿envío Full, ya despachado o aún no imprimible?).' });
+        }
+    });
+
+    // =========================================================================
+    // Mensajería post-venta + Preguntas pre-venta (M0, v2.9.0)
+    //
+    // Mismo contrato que el bloque de órdenes: pending (cola procesada, sin
+    // entregar) → ack (por ids de evento). Los proxies de escritura (reply /
+    // answer) van EN CALIENTE a ML con el token custodiado — el central no
+    // persiste conversaciones (cola de tránsito; retención purga entregadas).
+    // =========================================================================
+
+    // -------------------------------------------------------------------------
+    // GET /v1/messages/pending
+    // Respuesta: { ok, messages: [{ id, ml_message_id, message, received_at }] }
+    // `message` = payload CRUDO de ML (from/to/text/message_resources/fecha).
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/messages/pending'), authAccount, async (req, res) => {
+        const r = await query(
+            `SELECT id, ml_message_id, payload_json, received_at
+             FROM message_events
+             WHERE account_id = $1
+               AND processed_at IS NOT NULL
+               AND delivered_at IS NULL
+               AND error IS NULL
+             ORDER BY id
+             LIMIT 200`,
+            [req.account.id]
+        );
+        const messages = r.rows.map((row) => ({
+            id:            String(row.id),
+            ml_message_id: row.ml_message_id,
+            message:       row.payload_json || null,
+            received_at:   row.received_at,
+        }));
+        return res.json({ ok: true, messages });
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /v1/messages/ack   Body: { ids: ["1","2",...] } (ids de evento)
+    // -------------------------------------------------------------------------
+    app.post(p('/v1/messages/ack'), authAccount, async (req, res) => {
+        const ids = Array.isArray(req.body && req.body.ids)
+            ? req.body.ids.map((v) => String(v)).filter((v) => /^\d+$/.test(v))
+            : [];
+        if (!ids.length) return res.json({ ok: true, marked: 0 });
+        const r = await query(
+            `UPDATE message_events SET delivered_at = NOW()
+             WHERE account_id = $1 AND id = ANY($2::bigint[]) AND delivered_at IS NULL`,
+            [req.account.id, ids]
+        );
+        return res.json({ ok: true, marked: r.rowCount });
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /v1/messages/thread?pack_id=&offset=&limit=
+    // Proxy EN CALIENTE del hilo completo de un pack (para materializar la
+    // conversación al abrirla por primera vez en el plugin). No persiste nada.
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/messages/thread'), authAccount, async (req, res) => {
+        const packId = String(req.query.pack_id || '').trim();
+        if (!/^\d+$/.test(packId)) {
+            return res.status(400).json({ ok: false, error: 'bad_request', message: 'Falta pack_id.' });
+        }
+        const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+        const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 40));
+        try {
+            const token = await getValidAccessToken(req.account);
+            const data  = await mlGetPackMessages(req.account, token, packId, offset, limit);
+            return res.json({ ok: true, thread: data });
+        } catch (err) {
+            console.error('[v1/messages/thread] error:', err.message);
+            return res.status(502).json({ ok: false, error: 'thread_unavailable', message: 'Mercado Libre no entregó el hilo — probá de nuevo en unos minutos.' });
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /v1/messages/reply
+    // Body: { pack_id, buyer_user_id, text }
+    // Proxy EN CALIENTE: responde al comprador en el hilo del pack.
+    // -------------------------------------------------------------------------
+    app.post(p('/v1/messages/reply'), authAccount, async (req, res) => {
+        const packId  = String((req.body && req.body.pack_id) || '').trim();
+        const buyerId = String((req.body && req.body.buyer_user_id) || '').trim();
+        const text    = String((req.body && req.body.text) || '').trim();
+        if (!/^\d+$/.test(packId) || !/^\d+$/.test(buyerId) || !text) {
+            return res.status(400).json({ ok: false, error: 'bad_request', message: 'Faltan pack_id, buyer_user_id o text.' });
+        }
+        try {
+            const token = await getValidAccessToken(req.account);
+            const r = await mlSendPackMessage(req.account, token, packId, buyerId, text);
+            if (!r.ok) {
+                const msg = (r.data && (r.data.message || r.data.error)) || `HTTP ${r.status}`;
+                return res.status(502).json({ ok: false, error: 'ml_rejected', message: `Mercado Libre rechazó el mensaje: ${msg}` });
+            }
+            return res.json({ ok: true, message: r.data || null });
+        } catch (err) {
+            console.error('[v1/messages/reply] error:', err.message);
+            return res.status(502).json({ ok: false, error: 'reply_failed', message: 'No se pudo enviar el mensaje a Mercado Libre.' });
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /v1/questions/pending + POST /v1/questions/ack — mismo contrato.
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/questions/pending'), authAccount, async (req, res) => {
+        const r = await query(
+            `SELECT id, ml_question_id, payload_json, received_at
+             FROM question_events
+             WHERE account_id = $1
+               AND processed_at IS NOT NULL
+               AND delivered_at IS NULL
+               AND error IS NULL
+             ORDER BY id
+             LIMIT 200`,
+            [req.account.id]
+        );
+        const questions = r.rows.map((row) => ({
+            id:             String(row.id),
+            ml_question_id: row.ml_question_id,
+            question:       row.payload_json || null,
+            received_at:    row.received_at,
+        }));
+        return res.json({ ok: true, questions });
+    });
+
+    app.post(p('/v1/questions/ack'), authAccount, async (req, res) => {
+        const ids = Array.isArray(req.body && req.body.ids)
+            ? req.body.ids.map((v) => String(v)).filter((v) => /^\d+$/.test(v))
+            : [];
+        if (!ids.length) return res.json({ ok: true, marked: 0 });
+        const r = await query(
+            `UPDATE question_events SET delivered_at = NOW()
+             WHERE account_id = $1 AND id = ANY($2::bigint[]) AND delivered_at IS NULL`,
+            [req.account.id, ids]
+        );
+        return res.json({ ok: true, marked: r.rowCount });
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /v1/questions/answer   Body: { question_id, text }
+    // Proxy EN CALIENTE: responde la pregunta en ML.
+    // -------------------------------------------------------------------------
+    app.post(p('/v1/questions/answer'), authAccount, async (req, res) => {
+        const qid  = String((req.body && req.body.question_id) || '').trim();
+        const text = String((req.body && req.body.text) || '').trim();
+        if (!/^\d+$/.test(qid) || !text) {
+            return res.status(400).json({ ok: false, error: 'bad_request', message: 'Faltan question_id o text.' });
+        }
+        try {
+            const token = await getValidAccessToken(req.account);
+            const r = await mlAnswerQuestion(req.account, token, qid, text);
+            if (!r.ok) {
+                const msg = (r.data && (r.data.message || r.data.error)) || `HTTP ${r.status}`;
+                return res.status(502).json({ ok: false, error: 'ml_rejected', message: `Mercado Libre rechazó la respuesta: ${msg}` });
+            }
+            return res.json({ ok: true, answer: r.data || null });
+        } catch (err) {
+            console.error('[v1/questions/answer] error:', err.message);
+            return res.status(502).json({ ok: false, error: 'answer_failed', message: 'No se pudo enviar la respuesta a Mercado Libre.' });
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /v1/questions/backfill
+    // Siembra las preguntas ABIERTAS (sin responder) de la cuenta en la cola,
+    // como si hubieran llegado por webhook (decisión del dueño: al activar el
+    // módulo no se pierde ninguna pregunta pendiente). Inline y acotado
+    // (≤10 páginas de 50); idempotente: no re-siembra preguntas que ya tienen
+    // un evento sin entregar.
+    // -------------------------------------------------------------------------
+    app.post(p('/v1/questions/backfill'), authAccount, async (req, res) => {
+        try {
+            const token = await getValidAccessToken(req.account);
+            let offset = 0, seeded = 0, total = 0;
+            for (let page = 0; page < 10; page++) {
+                const { questions, total: t } = await mlSearchQuestions(req.account, token, { status: 'UNANSWERED', offset, limit: 50 });
+                total = t;
+                if (!questions.length) break;
+                for (const q of questions) {
+                    if (!q || q.id == null) continue;
+                    const r = await query(
+                        `INSERT INTO question_events (account_id, ml_question_id, processed_at, payload_json)
+                         SELECT $1, $2, NOW(), $3
+                         WHERE NOT EXISTS (
+                             SELECT 1 FROM question_events
+                             WHERE account_id = $1 AND ml_question_id = $2 AND delivered_at IS NULL
+                         )`,
+                        [req.account.id, String(q.id), JSON.stringify(q)]
+                    );
+                    seeded += r.rowCount;
+                }
+                offset += questions.length;
+                if (offset >= total) break;
+            }
+            return res.json({ ok: true, seeded, total });
+        } catch (err) {
+            console.error('[v1/questions/backfill] error:', err.message);
+            return res.status(502).json({ ok: false, error: 'backfill_failed', message: 'No se pudieron traer las preguntas abiertas de Mercado Libre.' });
         }
     });
 

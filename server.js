@@ -1880,6 +1880,8 @@ app.post('/connect-mp/refresh-token', limitMpFinishRefresh, async (req, res) => 
 const WEBHOOK_ITEM_TOPICS     = new Set(['items', 'items_prices']);
 const WEBHOOK_ORDER_TOPICS    = new Set(['orders_v2', 'orders']);
 const WEBHOOK_SHIPMENT_TOPICS = new Set(['shipments']); // Mercado Envíos (P2): frescura de estados
+const WEBHOOK_MESSAGE_TOPICS  = new Set(['messages']);  // Mensajería post-venta (M0, v2.9.0)
+const WEBHOOK_QUESTION_TOPICS = new Set(['questions']); // Preguntas pre-venta (M0, v2.9.0)
 
 // Hardening #26 (2026-05-25): el endpoint /webhooks es necesariamente público
 // (ML manda POSTs desde sus servidores, sin auth header — ML no firma webhooks).
@@ -1945,18 +1947,28 @@ app.post(['/connect-ml/webhooks', '/webhooks'], limitWebhooks, (req, res) => {
     const isItem     = WEBHOOK_ITEM_TOPICS.has(topic);
     const isOrder    = WEBHOOK_ORDER_TOPICS.has(topic);
     const isShipment = WEBHOOK_SHIPMENT_TOPICS.has(topic);
-    if (!isItem && !isOrder && !isShipment) {
-        // messages, claims, etc. — fuera del scope actual.
+    const isMessage  = WEBHOOK_MESSAGE_TOPICS.has(topic);
+    const isQuestion = WEBHOOK_QUESTION_TOPICS.has(topic);
+    if (!isItem && !isOrder && !isShipment && !isMessage && !isQuestion) {
+        // claims, etc. — fuera del scope actual.
         return;
     }
 
-    // Extraer el id del recurso: "/items/MLA123[/prices]", "/orders/123" o "/shipments/123".
+    // Extraer el id del recurso: "/items/MLA123[/prices]", "/orders/123",
+    // "/shipments/123", "/messages/{id}" o "/questions/123".
     let resourceId = '';
     if (isItem) {
         const m = resource.match(/\/items\/([A-Za-z0-9]+)/);
         resourceId = m ? m[1] : '';
     } else if (isShipment) {
         const m = resource.match(/\/shipments\/(\d+)/);
+        resourceId = m ? m[1] : '';
+    } else if (isMessage) {
+        // El id de mensaje de ML es alfanumérico (hash largo).
+        const m = resource.match(/\/messages\/([A-Za-z0-9_-]+)/);
+        resourceId = m ? m[1] : '';
+    } else if (isQuestion) {
+        const m = resource.match(/\/questions\/(\d+)/);
         resourceId = m ? m[1] : '';
     } else {
         const m = resource.match(/\/orders\/(\d+)/);
@@ -2005,6 +2017,20 @@ app.post(['/connect-ml/webhooks', '/webhooks'], limitWebhooks, (req, res) => {
                         [accountId, row.ml_order_id]
                     );
                 }
+            } else if (isMessage) {
+                // Mensajería post-venta (M0): encolar; el tick baja el mensaje
+                // con el token custodiado y lo deja listo para el plugin.
+                await dbQuery(
+                    `INSERT INTO message_events (account_id, ml_message_id, resource)
+                     VALUES ($1, $2, $3)`,
+                    [accountId, resourceId, resource]
+                );
+            } else if (isQuestion) {
+                await dbQuery(
+                    `INSERT INTO question_events (account_id, ml_question_id)
+                     VALUES ($1, $2)`,
+                    [accountId, resourceId]
+                );
             } else {
                 await dbQuery(
                     `INSERT INTO order_events (account_id, ml_order_id)
