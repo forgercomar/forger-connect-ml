@@ -40,7 +40,7 @@ import {
     openSecret,
 } from './auth.js';
 import { verifyCapabilityToken } from './license-token.js';
-import { getValidAccessToken, mlGetShipmentLabel, mlGetPackMessages, mlSendPackMessage, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
+import { getValidAccessToken, refreshAccessToken, mlGetShipmentLabel, mlGetPackMessages, mlSendPackMessage, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
 
 // Header donde el satélite ML manda el capability-token de licencia (Fase 6).
 // (El central TN usa X-Wftn-License-Token con este MISMO archivo copiado.)
@@ -197,7 +197,9 @@ async function authAccount(req, res, next) {
     try {
         const r = await query(
             `SELECT id, public_id, ml_user_id, ml_nickname, ml_site_id, site_url, shared_secret, revoked_at,
-                    last_valid_license_token_at, license_id, license_exp
+                    last_valid_license_token_at, license_id, license_exp,
+                    access_token_enc, access_token_iv, access_expires_at,
+                    refresh_token_enc, refresh_token_iv
              FROM accounts WHERE public_id = $1`,
             [publicId]
         );
@@ -1264,6 +1266,9 @@ export function mountV1(app, opts = {}) {
             return res.json({ ok: true, message: r.data || null });
         } catch (err) {
             console.error('[v1/messages/reply] error:', err.message);
+            if (/sin refresh_token utilizable/.test(err.message)) {
+                return res.status(409).json({ ok: false, error: 'no_refresh_token', message: 'La cuenta de Mercado Libre necesita reconectarse: el servidor no tiene un refresh_token válido guardado.' });
+            }
             return res.status(502).json({ ok: false, error: 'reply_failed', message: 'No se pudo enviar el mensaje a Mercado Libre.' });
         }
     });
@@ -1325,7 +1330,38 @@ export function mountV1(app, opts = {}) {
             return res.json({ ok: true, answer: r.data || null });
         } catch (err) {
             console.error('[v1/questions/answer] error:', err.message);
+            if (/sin refresh_token utilizable/.test(err.message)) {
+                return res.status(409).json({ ok: false, error: 'no_refresh_token', message: 'La cuenta de Mercado Libre necesita reconectarse: el servidor no tiene un refresh_token válido guardado.' });
+            }
             return res.status(502).json({ ok: false, error: 'answer_failed', message: 'No se pudo enviar la respuesta a Mercado Libre.' });
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /v1/token   → devuelve un access_token de ML válido para la cuenta.
+    // El central es el ÚNICO dueño/refrescador del refresh_token (ML lo rota en
+    // cada uso; si el plugin también refrescara, se desincronizarían). El plugin
+    // pide el access_token acá para sus llamadas directas a ML en vez de rotar
+    // por su cuenta. getValidAccessToken reusa el cacheado o refresca si venció.
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/token'), authAccount, async (req, res) => {
+        try {
+            // ?force=1 → refrescar sí o sí (lo usa el plugin tras un 401 de ML:
+            // el token cacheado del central podría estar vencido antes de tiempo).
+            const force = String(req.query.force || '') === '1';
+            const token = force ? await refreshAccessToken(req.account) : await getValidAccessToken(req.account);
+            // access_expires_at queda fresco tras un refresh (getValidAccessToken lo
+            // muta); si vino del cache, ya estaba seteado. Fallback defensivo: +5min.
+            const expMs = req.account.access_expires_at
+                ? new Date(req.account.access_expires_at).getTime()
+                : (Date.now() + 5 * 60 * 1000);
+            return res.json({ ok: true, access_token: token, expires_at: Math.floor(expMs / 1000) });
+        } catch (err) {
+            console.error('[v1/token] error:', err.message);
+            if (/sin refresh_token utilizable/.test(err.message)) {
+                return res.status(409).json({ ok: false, error: 'no_refresh_token', message: 'La cuenta de Mercado Libre necesita reconectarse: el servidor no tiene un refresh_token válido guardado.' });
+            }
+            return res.status(502).json({ ok: false, error: 'token_failed', message: 'No se pudo obtener un token de Mercado Libre.' });
         }
     });
 
