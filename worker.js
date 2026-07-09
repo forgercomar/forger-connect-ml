@@ -24,6 +24,7 @@
  */
 
 import { query, tx } from './db.js';
+import { accountLicenseVerdict } from './license-context.js';
 import {
     getValidAccessToken,
     mlSearchItems,
@@ -45,10 +46,24 @@ let _license = null; // { getContext, isEnforcing, isLicenseActive }
 // Sin esto, claimJob lo re-tomaría cada tick (~5s) y nunca avanzaría otros jobs.
 const LICENSE_SKIP_BACKOFF_MS = 5 * 60_000; // 5 min entre reintentos de un job vencido
 const _licenseSkipUntil = new Map(); // jobId → epoch ms hasta el que no re-procesar
+
+// TTL de espera por licencia: un job NO puede esperar la renovación para siempre.
+// Aplicar un push viejo al renovar días después pisaría precios/stock más nuevos.
+// Al cancelarlo NO se pierde nada: el diff sigue figurando "Pendiente de push" en
+// la grilla del cliente (verdad = build_payload vs espejo) y se re-pushea fresco.
+const LICENSE_BLOCK_TTL_MS = Math.max(60 * 60_000, Number(process.env.WFML_LICENSE_BLOCK_TTL_MS) || 24 * 60 * 60_000);
+
+// Anti-spam del log: "EN ESPERA — licencia vencida" se loguea 1 vez por hora por
+// job (antes: una línea cada 5 min por job, para siempre).
+const _licenseLogAt = new Map(); // jobId → epoch ms del último log
+
 setInterval(() => {
     const now = Date.now();
     for (const [k, v] of _licenseSkipUntil.entries()) {
         if (v < now) _licenseSkipUntil.delete(k);
+    }
+    for (const [k, v] of _licenseLogAt.entries()) {
+        if (now - v > 2 * 60 * 60_000) _licenseLogAt.delete(k);
     }
 }, 10 * 60_000).unref();
 
@@ -65,30 +80,9 @@ function licenseBlocksJob(account) {
     if (!_license || !_license.isLicenseActive() || !_license.isEnforcing()) {
         return { blocked: false };
     }
-    const ctx = _license.getContext();
-
-    // Revoke explícito gana siempre (incluso sobre gracia).
-    if (account.license_id && ctx.denylist.has(String(account.license_id))) {
-        return { blocked: true, reason: 'revoked' };
-    }
-
-    const expMs = account.license_exp ? new Date(account.license_exp).getTime() : 0;
-    // Sin license_exp conocido: nunca presentó un token válido (o pre-Fase6).
-    // No bloqueamos por ausencia de datos — el gate del request (authAccount) ya
-    // cubre el handshake/jobs en vivo; acá solo cortamos vencimientos confirmados.
-    if (!expMs) return { blocked: false };
-
-    const now = Date.now();
-    if (expMs > now) return { blocked: false }; // licencia vigente
-
-    // Vencida → ¿dentro de gracia? (ancla = último token válido presentado).
-    const anchorMs = account.last_valid_license_token_at
-        ? new Date(account.last_valid_license_token_at).getTime()
-        : 0;
-    const inGrace = anchorMs > 0 && (now - anchorMs) <= ctx.gracePeriodSec * 1000;
-    if (inGrace) return { blocked: false };
-
-    return { blocked: true, reason: 'expired' };
+    // Regla ÚNICA compartida con GET /v1/jobs/:id (license-context.js) — así el
+    // plugin recibe el MISMO veredicto que aplica el worker y puede mostrarlo.
+    return accountLicenseVerdict(account);
 }
 
 /**
@@ -655,7 +649,7 @@ async function claimJob() {
             FOR UPDATE SKIP LOCKED
             LIMIT 1
          )
-         RETURNING id, public_id, account_id, type, input, started_at`,
+         RETURNING id, public_id, account_id, type, input, started_at, created_at`,
         [deferred.length ? deferred.map((x) => Number(x)) : [0]]
     );
     return r.rowCount ? r.rows[0] : null;
@@ -685,9 +679,36 @@ async function jobBlockedByLicense(job) {
     if (!account) return false; // processSyncJob/processPushJob lo manejan (cuenta no encontrada)
 
     const verdict = licenseBlocksJob(account);
-    if (!verdict.blocked) return false;
+    if (!verdict.blocked) {
+        _licenseLogAt.delete(String(job.id));
+        return false;
+    }
 
-    console.warn(`[worker] job ${job.public_id} EN ESPERA — licencia ${verdict.reason} para cuenta ${account.public_id} (fuera de gracia). Se reintenta en ${LICENSE_SKIP_BACKOFF_MS / 60000}min.`);
+    // TTL: pasado el plazo, el job se CANCELA con motivo claro en vez de esperar
+    // para siempre (aplicar un push viejo tras renovar pisaría datos más nuevos;
+    // el pendiente sigue visible en la grilla del cliente y se re-pushea fresco).
+    const createdMs = job.created_at ? new Date(job.created_at).getTime() : 0;
+    if (createdMs && (Date.now() - createdMs) > LICENSE_BLOCK_TTL_MS) {
+        try {
+            await query(
+                `UPDATE jobs SET status = 'cancelled', finished_at = NOW(), message = $2
+                 WHERE id = $1 AND status = 'running'`,
+                [job.id, 'Cancelado: la licencia lleva vencida más de ' + Math.round(LICENSE_BLOCK_TTL_MS / 3600000) + 'h. Renovala y volvé a pushear — el cambio sigue como pendiente en la grilla.']
+            );
+        } catch (e) {
+            console.warn('[worker] cancel por licencia falló:', e.message);
+        }
+        _licenseSkipUntil.delete(String(job.id));
+        _licenseLogAt.delete(String(job.id));
+        console.warn(`[worker] job ${job.public_id} CANCELADO — licencia ${verdict.reason} > TTL para cuenta ${account.public_id}.`);
+        return true;
+    }
+
+    const lastLog = _licenseLogAt.get(String(job.id)) || 0;
+    if (Date.now() - lastLog > 60 * 60_000) {
+        _licenseLogAt.set(String(job.id), Date.now());
+        console.warn(`[worker] job ${job.public_id} EN ESPERA — licencia ${verdict.reason} para cuenta ${account.public_id} (fuera de gracia). Se reintenta cada ${LICENSE_SKIP_BACKOFF_MS / 60000}min (este aviso se loguea 1 vez/hora).`);
+    }
     await deferJobForLicense(job, verdict.reason);
     return true;
 }

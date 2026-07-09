@@ -40,6 +40,7 @@ import {
     openSecret,
 } from './auth.js';
 import { verifyCapabilityToken } from './license-token.js';
+import { accountLicenseVerdict } from './license-context.js';
 import { getValidAccessToken, refreshAccessToken, mlGetShipmentLabel, mlGetPackMessages, mlSendPackMessage, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
 
 // Header donde el satélite ML manda el capability-token de licencia (Fase 6).
@@ -666,6 +667,23 @@ export function mountV1(app, opts = {}) {
         );
         if (!r.rowCount) return res.status(404).json({ ok: false, error: 'not_found' });
         const j = r.rows[0];
+        // ¿La cuenta está bloqueada por licencia AHORA? (misma regla que el gate
+        // del worker). El plugin lo usa para decirle al operador POR QUÉ el push
+        // espera (banner en el modo ML + aviso del quickbar) en vez de un
+        // "Pendiente" mudo. Solo tiene sentido en jobs aún no terminados.
+        let license_blocked = false;
+        let license_reason  = null;
+        if (j.status === 'pending' || j.status === 'running') {
+            try {
+                const accR = await query(
+                    `SELECT license_id, license_exp, last_valid_license_token_at
+                     FROM accounts WHERE id = $1`,
+                    [req.account.id]
+                );
+                const v = accountLicenseVerdict(accR.rows[0] || null);
+                if (v.blocked) { license_blocked = true; license_reason = v.reason || 'expired'; }
+            } catch (e) { /* sin veredicto no agregamos info — nunca rompemos el status */ }
+        }
         return res.json({
             ok: true,
             job: {
@@ -681,6 +699,8 @@ export function mountV1(app, opts = {}) {
                 started_at: j.started_at,
                 finished_at: j.finished_at,
                 message: j.message,
+                license_blocked,
+                license_reason,
             },
         });
     });

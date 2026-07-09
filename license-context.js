@@ -119,6 +119,36 @@ export function replaceDenylist(licenseIds) {
     return ctx.denylist.size;
 }
 
+/**
+ * Veredicto de licencia para una CUENTA (fila de accounts, con gracia) — la
+ * regla ÚNICA que comparten el worker (saltear/cancelar jobs de cuentas
+ * vencidas) y GET /v1/jobs/:id (exponer `license_blocked` al plugin para que
+ * el operador VEA por qué su push está esperando, en vez de un "Pendiente"
+ * mudo). Denylist (revoke explícito) gana siempre, incluso sobre la gracia.
+ * Sin license_exp conocido no bloquea (pre-Fase6 / nunca presentó token: el
+ * gate del request cubre ese caso).
+ *
+ * @param {object|null} account fila con { license_id, license_exp, last_valid_license_token_at }
+ * @returns {{ blocked: boolean, reason?: 'revoked'|'expired' }}
+ */
+export function accountLicenseVerdict(account) {
+    if (!isLicenseActive() || !isEnforcing()) return { blocked: false };
+    if (!account) return { blocked: false };
+    if (account.license_id && ctx.denylist.has(String(account.license_id))) {
+        return { blocked: true, reason: 'revoked' };
+    }
+    const expMs = account.license_exp ? new Date(account.license_exp).getTime() : 0;
+    if (!expMs) return { blocked: false };
+    const now = Date.now();
+    if (expMs > now) return { blocked: false };
+    const anchorMs = account.last_valid_license_token_at
+        ? new Date(account.last_valid_license_token_at).getTime()
+        : 0;
+    const inGrace = anchorMs > 0 && (now - anchorMs) <= ctx.gracePeriodSec * 1000;
+    if (inGrace) return { blocked: false };
+    return { blocked: true, reason: 'expired' };
+}
+
 /** Agrega un license_id a la denylist viva (usado por el endpoint de revoke). */
 export function addToDenylist(licenseId) {
     if (licenseId) ctx.denylist.add(String(licenseId));
