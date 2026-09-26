@@ -266,7 +266,7 @@ app.use((req, res, next) => {
 // el cliente firmó (orden de keys, espacios, etc.).
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 app.use(express.json({
-    limit: '4mb', // v1/jobs con miles de items necesita más
+    limit: '16mb', // v1/jobs con miles de items necesita más (push masivo de un seller de ~5.000 publicaciones: varios MB)
     verify: (req, _res, buf) => {
         req.rawBody = buf && buf.length ? buf.toString('utf8') : '';
     },

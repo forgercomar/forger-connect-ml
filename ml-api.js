@@ -216,6 +216,35 @@ export async function mlSearchItems(account, accessToken, offset, limit, orders 
 }
 
 /**
+ * Lista los IDs de items del seller en modo SCAN (sellers grandes).
+ *   GET /users/{uid}/items/search?search_type=scan&limit=[&scroll_id=]
+ *
+ * ML corta la paginación por offset en 1.000 items. Con search_type=scan la
+ * primera respuesta trae un `scroll_id` que se reenvía tal cual en cada llamada
+ * siguiente hasta que `results` viene vacío. Límite máximo por página: 100.
+ * El scroll_id vence a los 5 minutos de inactividad (entre página y página
+ * hacemos multi-get, lejos de ese tope).
+ *
+ * @param {string} [scrollId] vacío en la primera llamada; después, el devuelto.
+ * @returns {Promise<{ ids: string[], total: number, scroll_id: string }>}
+ */
+export async function mlSearchItemsScan(account, accessToken, scrollId, limit) {
+    const uid = Number(account.ml_user_id);
+    const lim = Math.max(1, Math.min(100, Number(limit) || 100));
+    let path = `/users/${uid}/items/search?search_type=scan&limit=${lim}`;
+    if (scrollId) path += `&scroll_id=${encodeURIComponent(scrollId)}`;
+    const r = await mlGet(account, path, accessToken);
+    if (!r.ok || !r.data) {
+        throw new Error(`items/search (scan) falló: HTTP ${r.status} ${(r.data && r.data.message) || ''}`);
+    }
+    return {
+        ids:       Array.isArray(r.data.results) ? r.data.results : [],
+        total:     Number(r.data.paging && r.data.paging.total) || 0,
+        scroll_id: String(r.data.scroll_id || scrollId || ''),
+    };
+}
+
+/**
  * Trae una orden completa de ML.
  *   GET /orders/{id}
  *

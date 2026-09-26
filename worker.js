@@ -15,10 +15,21 @@
  * event loop no se bloquea. Para escalar a muchos clientes simultáneos se
  * puede mover a un proceso aparte — el lock SKIP LOCKED ya lo hace seguro.
  *
+ * Son DOS loops independientes (v2.10.0): uno para los jobs de sync (sync_full /
+ * sync_incremental) y otro para los `push` de stock/precio. Antes era un solo
+ * loop FIFO: un full sync de miles de publicaciones frenaba los push de TODAS
+ * las cuentas durante minutos (ventana de sobreventa). Los dos loops reclaman
+ * con FOR UPDATE SKIP LOCKED, así que nunca toman el mismo job.
+ *
  * Variables de entorno:
  *   WFML_WORKER_ENABLED   '0' para apagar el worker (default: encendido)
- *   WFML_WORKER_INTERVAL  ms entre ticks (default 5000)
- *   WFML_SYNC_CHUNK       items por página de ML (default 50, max 50 = cap ML)
+ *   WFML_WORKER_INTERVAL  ms entre ticks del loop de sync (default 5000)
+ *   WFML_PUSH_INTERVAL    ms entre ticks del loop de push (default 2000)
+ *   WFML_SYNC_CHUNK       items por página de ML por offset (default 50, max 50 = cap ML)
+ *   WFML_SCAN_THRESHOLD   a partir de cuántas publicaciones el full usa search_type=scan (default 1000)
+ *   WFML_SCAN_LIMIT       ids por página en modo scan (default 100, max 100 = cap ML)
+ *   WFML_PUSH_PAUSE_MS    pausa entre PUT de un push masivo (default 0)
+ *   WFML_PUSH_PROGRESS_EVERY  cada cuántos PUT se persiste el resultado parcial (default 25)
  *
  * @module worker
  */
@@ -28,6 +39,7 @@ import { accountLicenseVerdict } from './license-context.js';
 import {
     getValidAccessToken,
     mlSearchItems,
+    mlSearchItemsScan,
     mlGetItems,
     mlUpdateItem,
     ML_BATCH_SIZE,
@@ -36,6 +48,23 @@ import {
 const WORKER_ENABLED  = process.env.WFML_WORKER_ENABLED !== '0';
 const WORKER_INTERVAL = Math.max(2000, Number(process.env.WFML_WORKER_INTERVAL) || 5000);
 const SYNC_CHUNK      = Math.max(1, Math.min(50, Number(process.env.WFML_SYNC_CHUNK) || 50));
+
+// Sellers grandes: ML no pagina por offset más allá de ML_OFFSET_CAP items en
+// /users/{uid}/items/search. A partir de SCAN_THRESHOLD publicaciones el full
+// sync pagina con search_type=scan + scroll_id (hasta 100 por página, sin tope).
+const ML_OFFSET_CAP   = 1000;
+const SCAN_THRESHOLD  = Math.max(1, Number(process.env.WFML_SCAN_THRESHOLD) || ML_OFFSET_CAP);
+const SCAN_LIMIT      = Math.max(1, Math.min(100, Number(process.env.WFML_SCAN_LIMIT) || 100));
+
+// Loop de push aparte (ver encabezado): intervalo propio, pausa opcional entre
+// PUT (para no martillar a ML en pushes de miles) y persistencia del resultado
+// parcial cada N PUT (si el proceso muere a mitad, lo ya aplicado queda a la
+// vista del plugin en jobs.result en vez de perderse).
+const PUSH_INTERVAL       = Math.max(1000, Number(process.env.WFML_PUSH_INTERVAL) || 2000);
+const PUSH_PAUSE_MS       = Math.max(0, Number(process.env.WFML_PUSH_PAUSE_MS) || 0);
+const PUSH_PROGRESS_EVERY = Math.max(1, Number(process.env.WFML_PUSH_PROGRESS_EVERY) || 25);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Enforcement de licencia (Fase 6). Lo inyecta server.js vía startWorker(); si no,
 // queda null → el worker no aplica ningún gate (comportamiento "off").
@@ -110,8 +139,10 @@ async function deferJobForLicense(job, reason) {
 // uno por desfasaje de reloj o empate de orden, no — por eso el corte es generoso.
 const INCREMENTAL_MARGIN_MS = 60 * 60 * 1000; // 1 hora
 
-// Flag para evitar que dos ticks se solapen si un job tarda más que el intervalo.
-let _busy = false;
+// Flags para evitar que dos ticks del MISMO loop se solapen si un job tarda más
+// que el intervalo. Sync y push tienen cada uno el suyo: son loops independientes.
+let _busySync = false;
+let _busyPush = false;
 
 // ----------------------------------------------------------------------------
 // Construcción del row para wf_ml_items
@@ -377,17 +408,23 @@ async function processSyncJob(job) {
     // 3) Primera búsqueda para conocer el total.
     const first = await mlSearchItems(account, token, 0, SYNC_CHUNK);
     const total = first.total;
-    const stepsTotal = Math.max(1, Math.ceil(total / SYNC_CHUNK));
+    // Sellers grandes (v2.10.0): por encima de SCAN_THRESHOLD publicaciones ML
+    // no deja paginar por offset (cap 1.000) → modo scan con scroll_id. Antes el
+    // full de un seller de 5.000 publicaciones veía solo las primeras 1.000.
+    const useScan   = total > SCAN_THRESHOLD;
+    const pageSize  = useScan ? SCAN_LIMIT : SYNC_CHUNK;
+    const stepsTotal = Math.max(1, Math.ceil(total / pageSize));
     await query(
         `UPDATE jobs SET steps_total = $2, steps_done = 0,
                          message = $3
          WHERE id = $1`,
-        [job.id, stepsTotal, `Sincronizando ${total} publicaciones...`]
+        [job.id, stepsTotal, `Sincronizando ${total} publicaciones${useScan ? ' (modo scan)' : ''}...`]
     );
 
-    // 4) Procesar la primera página (ya la tenemos) y después el resto.
+    // 4) Procesar página por página.
     let processed = 0;
     let stepsDone = 0;
+    let truncated = false;
 
     async function handlePage(ids) {
         if (!ids.length) return;
@@ -411,16 +448,44 @@ async function processSyncJob(job) {
         );
     }
 
-    await handlePage(first.ids);
-
-    // 5) Resto de las páginas.
-    for (let offset = SYNC_CHUNK; offset < total; offset += SYNC_CHUNK) {
-        if (!(await jobIsActive(job.id))) {
-            console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
-            return; // el status ya quedó en cancelled
+    if (useScan) {
+        // Modo scan: arranca de cero (la página por offset de arriba solo sirvió
+        // para conocer el total) y reenvía el scroll_id hasta que ML devuelve
+        // una página vacía. `seen` descarta ids repetidos entre páginas para que
+        // ningún item entre dos veces en staging; el tope de iteraciones evita
+        // un loop sin fin si ML repitiera páginas.
+        const seen = new Set();
+        let scrollId = '';
+        let iterations = 0;
+        const maxIterations = Math.ceil(total / SCAN_LIMIT) + 10;
+        for (;;) {
+            if (!(await jobIsActive(job.id))) {
+                console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
+                return; // el status ya quedó en cancelled
+            }
+            if (++iterations > maxIterations) {
+                console.warn(`[worker] job ${job.public_id}: scan pasó ${maxIterations} páginas para ${total} publicaciones — corto por seguridad.`);
+                truncated = true;
+                break;
+            }
+            const page = await mlSearchItemsScan(account, token, scrollId, SCAN_LIMIT);
+            if (page.scroll_id) scrollId = page.scroll_id;
+            if (!page.ids.length) break;
+            const ids = page.ids.map(String).filter((id) => id && !seen.has(id));
+            for (const id of ids) seen.add(id);
+            await handlePage(ids);
         }
-        const page = await mlSearchItems(account, token, offset, SYNC_CHUNK);
-        await handlePage(page.ids);
+    } else {
+        // 5) Modo offset (sellers chicos): la primera página ya la tenemos.
+        await handlePage(first.ids);
+        for (let offset = SYNC_CHUNK; offset < total; offset += SYNC_CHUNK) {
+            if (!(await jobIsActive(job.id))) {
+                console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
+                return; // el status ya quedó en cancelled
+            }
+            const page = await mlSearchItems(account, token, offset, SYNC_CHUNK);
+            await handlePage(page.ids);
+        }
     }
 
     // 6) Done. Un sync full (o el primer incremental, que cae acá por no tener
@@ -431,11 +496,11 @@ async function processSyncJob(job) {
                          message = $3
          WHERE id = $1 AND status = 'running'`,
         [job.id,
-         JSON.stringify({ items_synced: processed, total }),
+         JSON.stringify({ items_synced: processed, total, mode: useScan ? 'full_scan' : 'full', truncated }),
          `Sync completo: ${processed} publicaciones.`]
     );
     await advanceWatermark(account.id, job.started_at);
-    console.log(`[worker] job ${job.public_id} done — ${processed} items`);
+    console.log(`[worker] job ${job.public_id} done (${useScan ? 'scan' : 'offset'}) — ${processed} items`);
 }
 
 /**
@@ -475,6 +540,7 @@ async function processIncrementalSync(job, account, token) {
     let processed = 0;
     let pages = 0;
     let reachedCutoff = false;
+    let capped = false;
     let total = 0;
 
     for (let offset = 0; ; offset += SYNC_CHUNK) {
@@ -482,6 +548,11 @@ async function processIncrementalSync(job, account, token) {
             console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
             return;
         }
+        // ML no pagina por offset más allá de 1.000 (y `orders=` no se combina
+        // con scan). Si en una ventana cambiaron más de 1.000 publicaciones,
+        // cortamos limpio y lo marcamos: antes el request fallaba y el job
+        // entero quedaba en failed. El full periódico (con scan) cubre el resto.
+        if (offset + SYNC_CHUNK > ML_OFFSET_CAP) { capped = true; break; }
         const page = await mlSearchItems(account, token, offset, SYNC_CHUNK, 'last_updated_desc');
         total = page.total;
         if (!page.ids.length) break;
@@ -515,13 +586,13 @@ async function processIncrementalSync(job, account, token) {
         `UPDATE jobs SET status = 'done', finished_at = NOW(), result = $2, message = $3
          WHERE id = $1 AND status = 'running'`,
         [job.id,
-         JSON.stringify({ items_synced: processed, mode: 'incremental', pages_scanned: pages, reached_cutoff: reachedCutoff }),
+         JSON.stringify({ items_synced: processed, mode: 'incremental', pages_scanned: pages, reached_cutoff: reachedCutoff, capped }),
          processed > 0
-            ? `Sync incremental: ${processed} publicación(es) actualizada(s).`
+            ? `Sync incremental: ${processed} publicación(es) actualizada(s).${capped ? ' Se revisaron las 1.000 más recientes; el resto lo cubre el sync completo.' : ''}`
             : 'Sync incremental: catálogo al día, sin cambios.']
     );
     await advanceWatermark(account.id, job.started_at);
-    console.log(`[worker] job ${job.public_id} done (incremental) — ${processed} items, ${pages} página(s)`);
+    console.log(`[worker] job ${job.public_id} done (incremental) — ${processed} items, ${pages} página(s)${capped ? ', tope de offset' : ''}`);
 }
 
 // ----------------------------------------------------------------------------
@@ -582,6 +653,8 @@ async function processPushJob(job) {
             console.log(`[worker] job ${job.public_id} cancelado a mitad — corto.`);
             return;
         }
+        // Pausa opcional entre PUT (pushes de miles: no martillar a ML).
+        if (PUSH_PAUSE_MS > 0 && done > 0) await sleep(PUSH_PAUSE_MS);
         const mlItemId = String((pu && pu.ml_item_id) || '');
         const body     = (pu && pu.body && typeof pu.body === 'object') ? pu.body : null;
         let r;
@@ -606,10 +679,23 @@ async function processPushJob(job) {
         results.push(r);
         if (r.ok) pushed++; else failed++;
         done++;
-        await query(
-            `UPDATE jobs SET steps_done = $2, message = $3, last_seen_at = NOW() WHERE id = $1`,
-            [job.id, done, `Pusheadas ${done}/${total} — ${pushed} OK, ${failed} con error...`]
-        );
+        const progressMsg = `Pusheadas ${done}/${total} — ${pushed} OK, ${failed} con error...`;
+        if (done % PUSH_PROGRESS_EVERY === 0 || done === total) {
+            // Resultado PARCIAL persistido (v2.10.0): si el proceso muere a mitad de
+            // un push de miles, el janitor marca el job failed pero lo ya aplicado
+            // queda a la vista en jobs.result en vez de perderse. El plugin aplica
+            // resultados SOLO con status 'done', así que no hay doble aplicación.
+            await query(
+                `UPDATE jobs SET steps_done = $2, message = $3, last_seen_at = NOW(), result = $4 WHERE id = $1`,
+                [job.id, done, progressMsg,
+                 JSON.stringify({ mode: 'push', partial: true, total, pushed, failed, items: results })]
+            );
+        } else {
+            await query(
+                `UPDATE jobs SET steps_done = $2, message = $3, last_seen_at = NOW() WHERE id = $1`,
+                [job.id, done, progressMsg]
+            );
+        }
     }
 
     await query(
@@ -626,11 +712,17 @@ async function processPushJob(job) {
 // Loop principal
 // ----------------------------------------------------------------------------
 
+const SYNC_TYPES = ['sync_full', 'sync_incremental'];
+const PUSH_TYPES = ['push'];
+
 /**
- * Toma un job pending procesable. Lock atómico para no doble-procesar.
- * Solo tipos sync_* — push/auto_link los maneja el plugin (modelo A).
+ * Toma un job pending procesable de los tipos pedidos. Lock atómico para no
+ * doble-procesar (FOR UPDATE SKIP LOCKED): el loop de sync y el de push pueden
+ * reclamar a la vez sin pisarse. auto_link lo maneja el plugin (modelo A).
+ *
+ * @param {string[]} types tipos de job que este loop procesa.
  */
-async function claimJob() {
+async function claimJob(types) {
     // Excluir jobs en backoff por licencia vencida (devueltos a 'pending' tras un
     // skip). Sin esto se re-claimearían cada tick y bloquearían a los demás.
     const now = Date.now();
@@ -643,14 +735,14 @@ async function claimJob() {
          WHERE id = (
             SELECT id FROM jobs
             WHERE status = 'pending'
-              AND type IN ('sync_full', 'sync_incremental', 'push')
+              AND type = ANY($2::text[])
               AND NOT (id = ANY($1::bigint[]))
             ORDER BY created_at ASC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
          )
          RETURNING id, public_id, account_id, type, input, started_at, created_at`,
-        [deferred.length ? deferred.map((x) => Number(x)) : [0]]
+        [deferred.length ? deferred.map((x) => Number(x)) : [0], types]
     );
     return r.rowCount ? r.rows[0] : null;
 }
@@ -713,38 +805,58 @@ async function jobBlockedByLicense(job) {
     return true;
 }
 
-async function tick() {
-    if (_busy) return;
-    _busy = true;
+/**
+ * Un tick: reclama UN job de los tipos dados y lo procesa entero. Compartido por
+ * los dos loops; cada uno pasa sus tipos y su flag de ocupado.
+ */
+async function runOne(types, label) {
+    const job = await claimJob(types);
+    if (!job) return;
+    // Gate de licencia (Fase 6): si la cuenta tiene licencia vencida/revocada
+    // fuera de gracia y enforcement activo, devolvemos el job a 'pending' (sin
+    // perderlo) y salimos del tick — el batch en curso de OTRO job no existe acá
+    // (un tick = un job), así que no cortamos nada a mitad.
+    if (await jobBlockedByLicense(job)) return;
+    console.log(`[worker:${label}] tomando job ${job.public_id} (${job.type})`);
     try {
-        const job = await claimJob();
-        if (!job) return;
-        // Gate de licencia (Fase 6): si la cuenta tiene licencia vencida/revocada
-        // fuera de gracia y enforcement activo, devolvemos el job a 'pending' (sin
-        // perderlo) y salimos del tick — el batch en curso de OTRO job no existe acá
-        // (un tick = un job), así que no cortamos nada a mitad.
-        if (await jobBlockedByLicense(job)) return;
-        console.log(`[worker] tomando job ${job.public_id} (${job.type})`);
-        try {
-            await (job.type === 'push' ? processPushJob(job) : processSyncJob(job));
-        } catch (err) {
-            console.error(`[worker] job ${job.public_id} falló:`, err.message);
-            await query(
-                `UPDATE jobs SET status = 'failed', finished_at = NOW(),
-                                 message = $2
-                 WHERE id = $1 AND status = 'running'`,
-                [job.id, 'Error: ' + err.message]
-            );
-        }
+        await (job.type === 'push' ? processPushJob(job) : processSyncJob(job));
     } catch (err) {
-        console.error('[worker] tick error:', err.message);
+        console.error(`[worker:${label}] job ${job.public_id} falló:`, err.message);
+        await query(
+            `UPDATE jobs SET status = 'failed', finished_at = NOW(),
+                             message = $2
+             WHERE id = $1 AND status = 'running'`,
+            [job.id, 'Error: ' + err.message]
+        );
+    }
+}
+
+async function tickSync() {
+    if (_busySync) return;
+    _busySync = true;
+    try {
+        await runOne(SYNC_TYPES, 'sync');
+    } catch (err) {
+        console.error('[worker:sync] tick error:', err.message);
     } finally {
-        _busy = false;
+        _busySync = false;
+    }
+}
+
+async function tickPush() {
+    if (_busyPush) return;
+    _busyPush = true;
+    try {
+        await runOne(PUSH_TYPES, 'push');
+    } catch (err) {
+        console.error('[worker:push] tick error:', err.message);
+    } finally {
+        _busyPush = false;
     }
 }
 
 /**
- * Arranca el loop del worker. Llamado una vez desde server.js.
+ * Arranca los dos loops del worker (sync y push). Llamado una vez desde server.js.
  */
 export function startWorker(opts = {}) {
     // Enforcement de licencia (Fase 6): server.js inyecta el contexto compartido.
@@ -753,6 +865,7 @@ export function startWorker(opts = {}) {
         console.log('[worker] deshabilitado (WFML_WORKER_ENABLED=0)');
         return;
     }
-    console.log(`[worker] arrancando — intervalo ${WORKER_INTERVAL}ms, chunk ${SYNC_CHUNK}`);
-    setInterval(() => { tick().catch((e) => console.error('[worker] tick uncaught:', e)); }, WORKER_INTERVAL);
+    console.log(`[worker] arrancando — sync cada ${WORKER_INTERVAL}ms (chunk ${SYNC_CHUNK}, scan desde ${SCAN_THRESHOLD}), push cada ${PUSH_INTERVAL}ms`);
+    setInterval(() => { tickSync().catch((e) => console.error('[worker:sync] tick uncaught:', e)); }, WORKER_INTERVAL);
+    setInterval(() => { tickPush().catch((e) => console.error('[worker:push] tick uncaught:', e)); }, PUSH_INTERVAL);
 }
