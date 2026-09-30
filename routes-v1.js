@@ -31,6 +31,7 @@
 
 import crypto from 'node:crypto';
 import { query, tx } from './db.js';
+import { SQL_SEMBRAR_PREGUNTA_ABIERTA } from './sql-preguntas.js';
 import {
     verifyRequest,
     generateSecret,
@@ -1403,15 +1404,9 @@ export function mountV1(app, opts = {}) {
                 if (!questions.length) break;
                 for (const q of questions) {
                     if (!q || q.id == null) continue;
-                    const r = await query(
-                        `INSERT INTO question_events (account_id, ml_question_id, processed_at, payload_json)
-                         SELECT $1, $2, NOW(), $3
-                         WHERE NOT EXISTS (
-                             SELECT 1 FROM question_events
-                             WHERE account_id = $1 AND ml_question_id = $2 AND delivered_at IS NULL
-                         )`,
-                        [req.account.id, String(q.id), JSON.stringify(q)]
-                    );
+                    // v2.10.1: la consulta vive en sql-preguntas.js con los tipos explícitos
+                    // (sin ellos Postgres la rechazaba con 42P08 y el backfill nunca sembraba).
+                    const r = await query(SQL_SEMBRAR_PREGUNTA_ABIERTA, [req.account.id, String(q.id), JSON.stringify(q)]);
                     seeded += r.rowCount;
                 }
                 offset += questions.length;
