@@ -368,7 +368,26 @@ export async function mlUpdateItem(account, accessToken, itemId, body, _isRetry 
 
 /**
  * Multi-get de items. ML acepta hasta 20 ids; el caller debe chunkear.
- *   GET /items?ids=A,B,C&attributes=...
+ *   GET /items/bulk?ids=A,B,C&attributes=body.…   primero (v2.10.2)
+ *   GET /items?ids=A,B,C&attributes=...           la de siempre, de vuelta
+ *
+ * ML deprecó /items?ids= («Migrá tus integraciones antes del 25/10/2026. Durante
+ * este período, los endpoints actuales y sus reemplazos convivirán»; no publicó la
+ * fecha de corte). La respuesta nueva se acepta SÓLO con la forma esperada
+ * (validarItemsBulk) y sale igual que la vieja: los body de los envoltorios con
+ * code 200, en el mismo orden. Con la misma respuesta de ML, lo que el worker deja
+ * en synced_items es idéntico por las dos lecturas.
+ *   - La nueva falla (HTTP, forma, ningún pedido, campos que faltan) → la vieja, y
+ *     el resto del job va directo a la vieja (no se duplica cada pedido).
+ *   - La nueva viene a medias → la tanda ENTERA con la vieja (nada se mezcla).
+ *   - La vieja contesta 404/410 (ya no existe) → el resto del job vuelve a la
+ *     nueva, sin vuelta.
+ *   - Las dos fallan → Error, como hoy (el job queda failed y el watermark no avanza).
+ * La nueva no renueva el token ante un 401: cae a la vieja, que lo renueva como siempre.
+ *
+ * El memo es del objeto de la cuenta: el worker carga la fila de accounts en cada
+ * job (processSyncJob), así que dura lo que dura el job. Interruptor sin cambiar
+ * código: ML_ITEMS_LECTURA=ids (sólo la vieja).
  *
  * @returns {Promise<object[]>} array de items completos (los body de cada wrapper)
  */
@@ -380,9 +399,91 @@ export async function mlGetItems(account, accessToken, ids) {
         'variations', 'listing_type_id', 'category_id', 'sale_terms',
         'installments', 'catalog_product_id', 'date_created', 'last_updated',
     ];
-    const path = `/items?ids=${ids.map(encodeURIComponent).join(',')}`
-               + `&attributes=${encodeURIComponent(attrs.join(','))}`;
-    const r = await mlGet(account, path, accessToken);
+    const idsQ = ids.map(encodeURIComponent).join(',');
+    const leerVieja = () => mlGet(account, `/items?ids=${idsQ}&attributes=${encodeURIComponent(attrs.join(','))}`, accessToken);
+
+    if (itemsLecturaModo() === 'ids') {
+        registrarLecturaItems(account, 'lectura /items?ids= (ML_ITEMS_LECTURA=ids)');
+        return cuerposDeItems(await leerVieja());
+    }
+
+    const memo = memoLecturaItems(account);
+    if (memo.estado === 'vieja') {
+        const rv = await leerVieja();
+        if (rv.ok || !VIEJA_NO_EXISTE.has(rv.status)) return cuerposDeItems(rv);
+        // La vieja dejó de existir a mitad del job: esta tanda y las que siguen, con la nueva.
+        memo.estado = 'sin_vieja';
+        registrarLecturaItems(account, `/items?ids= http_${rv.status} → /items/bulk (la vieja ya no existe)`, true);
+    }
+
+    let rn;
+    try {
+        rn = await mlGet(account, `/items/bulk?ids=${idsQ}&attributes=${encodeURIComponent(attrs.map((a) => 'body.' + a).join(','))}`, accessToken, true);
+    } catch (err) {
+        rn = { ok: false, status: 0, data: null, excepcion: err };
+    }
+    const v = validarItemsBulk(ids, rn);
+    if (v.estado === 'ok') {
+        registrarLecturaItems(account, 'lectura /items/bulk');
+        return cuerposDeItems(rn);
+    }
+
+    if (memo.estado === 'sin_vieja') {
+        registrarLecturaItems(account, `/items/bulk ${v.motivo}, sin vuelta (la vieja ya no existe)`, true);
+        if (v.estado === 'parcial') return v.validos.map((w) => w.body);
+        if (rn.excepcion) throw rn.excepcion;
+        throw new Error(`items multi-get falló: HTTP ${rn.status} (${v.motivo})`);
+    }
+
+    const rv = await leerVieja();
+    const viejaNoExiste = !rv.ok && VIEJA_NO_EXISTE.has(rv.status);
+    memo.estado = viejaNoExiste ? 'sin_vieja' : 'vieja';
+    registrarLecturaItems(account, `/items/bulk ${v.motivo} → /items?ids= ${rv.ok ? 'ok' : 'http_' + rv.status}`, true);
+    if (viejaNoExiste && v.estado === 'parcial') return v.validos.map((w) => w.body);
+    return cuerposDeItems(rv);
+}
+
+// La vieja contestó que el endpoint ya no existe.
+const VIEJA_NO_EXISTE = new Set([404, 410]);
+
+// Campos que trae toda publicación real: sin ellos la respuesta no sirve (el
+// incremental corta por last_updated).
+const ITEMS_NUCLEO = ['id', 'title', 'status', 'price', 'available_quantity', 'variations', 'last_updated'];
+
+/** 'bulk' (la nueva primero, por defecto) o 'ids' (sólo la vieja). Se lee en cada llamada. */
+function itemsLecturaModo() {
+    return String(process.env.ML_ITEMS_LECTURA || '').trim().toLowerCase() === 'ids' ? 'ids' : 'bulk';
+}
+
+// Memo de la lectura por objeto de cuenta (= por job). estado: '' (la nueva con
+// vuelta) | 'vieja' (la nueva ya falló: directo a la vieja) | 'sin_vieja'.
+const _lecturaItems = new WeakMap();
+function memoLecturaItems(account) {
+    if (!account || typeof account !== 'object') return { estado: '', registrado: '' };
+    let m = _lecturaItems.get(account);
+    if (!m) {
+        m = { estado: '', registrado: '' };
+        _lecturaItems.set(account, m);
+    }
+    return m;
+}
+
+/**
+ * Registro corto de qué lectura respondió y, si la nueva falló, por qué. Una línea
+ * por job y por cambio. Sin token, ids, títulos ni datos del vendedor: la cuenta va
+ * por su public_id de la central.
+ */
+function registrarLecturaItems(account, msg, aviso = false) {
+    const memo = memoLecturaItems(account);
+    if (memo.registrado === msg) return;
+    memo.registrado = msg;
+    const linea = `[items] cuenta ${(account && account.public_id) || '?'}: ${msg}`;
+    if (aviso) console.warn(linea);
+    else console.log(linea);
+}
+
+/** Lo que devolvía siempre el multi-get: los body con code 200, o Error si la respuesta no sirve. */
+function cuerposDeItems(r) {
     if (!r.ok || !Array.isArray(r.data)) {
         throw new Error(`items multi-get falló: HTTP ${r.status}`);
     }
@@ -394,6 +495,48 @@ export async function mlGetItems(account, accessToken, ids) {
         }
     }
     return out;
+}
+
+/**
+ * ¿La respuesta de /items/bulk tiene la forma esperada?
+ *   'ok'      → lista de envoltorios {code: 200, body} y cada pedido con su body
+ *               (id pedido + campos núcleo).
+ *   'parcial' → algunos sí y otros no (sin body, otro código, otro id, campos que
+ *               faltan, pedidos que no vinieron).
+ *   'falla'   → HTTP != 200, no es lista, todos sin body, ningún body.id pedido,
+ *               campos que faltan en todos.
+ *
+ * @returns {{ estado: string, motivo: string, validos: object[] }}
+ */
+function validarItemsBulk(ids, r) {
+    const falla = (motivo) => ({ estado: 'falla', motivo, validos: [] });
+    if (!r || !r.ok || r.status !== 200) return falla(`http_${(r && r.status) || 0}`);
+    const data = r.data;
+    if (!Array.isArray(data)) return falla('forma_no_lista');
+    if (!data.length) return falla('sin_pedidos');
+
+    const pedidos = new Set(ids.map(String));
+    const validos = [];
+    const cubiertos = new Set();
+    let sinBody = 0;
+    let conId = 0;
+    let otros = 0;
+    for (const w of data) {
+        if (!w || typeof w !== 'object' || !w.body || typeof w.body !== 'object') { sinBody++; continue; }
+        const bid = w.body.id == null ? '' : String(w.body.id);
+        if (w.code !== 200 || bid === '' || !pedidos.has(bid)) { otros++; continue; }
+        conId++;
+        if (!ITEMS_NUCLEO.every((k) => Object.prototype.hasOwnProperty.call(w.body, k))) { otros++; continue; }
+        validos.push(w);
+        cubiertos.add(bid);
+    }
+    if (sinBody === data.length) return falla('envoltorios_sin_body');
+    if (conId === 0) return falla('sin_pedidos');
+    if (!validos.length) return falla('sin_campos');
+    if (sinBody || otros || cubiertos.size < pedidos.size) {
+        return { estado: 'parcial', motivo: `parcial_${cubiertos.size}_de_${pedidos.size}`, validos };
+    }
+    return { estado: 'ok', motivo: '', validos };
 }
 
 // ----------------------------------------------------------------------------
