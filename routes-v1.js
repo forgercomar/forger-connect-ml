@@ -22,6 +22,7 @@
  *   POST /v1/orders/ack         → marca órdenes como aplicadas. Auth: cuenta.
  *   POST /v1/orders/backfill    → job de importación histórica (Ventas ML). Auth: cuenta.
  *   GET  /v1/orders/history     → pagina los snapshots completos. Auth: cuenta.
+ *   GET  /v1/orders/labels      → etiquetas de Mercado Envíos en lote (pdf|zpl). Auth: cuenta.
  *
  * Convenciones:
  *   - Toda fecha sale como ISO8601 UTC.
@@ -42,7 +43,7 @@ import {
 } from './auth.js';
 import { verifyCapabilityToken } from './license-token.js';
 import { accountLicenseVerdict } from './license-context.js';
-import { getValidAccessToken, refreshAccessToken, mlGetShipmentLabel, mlGetPackMessages, mlSendPackMessage, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
+import { getValidAccessToken, refreshAccessToken, mlGetShipmentLabel, mlGetShipmentLabels, mlGetPackMessages, mlSendPackMessage, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
 
 // Header donde el satélite ML manda el capability-token de licencia (Fase 6).
 // (El central TN usa X-Wftn-License-Token con este MISMO archivo copiado.)
@@ -1190,6 +1191,120 @@ export function mountV1(app, opts = {}) {
             console.error('[v1/orders/label] error:', err.message);
             return res.status(502).json({ ok: false, error: 'label_unavailable', message: 'Mercado Libre no entregó la etiqueta (¿envío Full, ya despachado o aún no imprimible?).' });
         }
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /v1/orders/labels?ml_order_ids=a,b,c&formato=pdf|zpl  (v2.10.3)
+    //
+    // Etiquetas de Mercado Envíos EN LOTE: hasta LABELS_MAX órdenes de LA CUENTA
+    // AUTENTICADA (una orden de otra cuenta no está en su snapshot y sale en
+    // «faltaron»), los shipment ids del snapshot y UN pedido a ML
+    // /shipment_labels?shipment_ids=…&response_type=pdf|zpl2. Si ML rechaza el
+    // lote nombrando envíos puntuales, se sacan esos y se pide UNA vez más con el
+    // resto. Nada se persiste.
+    //
+    // Respuesta: { ok, formato, tipo: 'pdf'|'zpl'|'zip', archivo_b64, incluidos,
+    //   faltaron: [{ ml_order_id, motivo }] } · 400 pedido mal formado o más de
+    //   LABELS_MAX · 422 ninguna imprimible · 502 si ML no las dio.
+    // Motivos: id_invalido, no_encontrada, sin_envio, full, no_imprimible, ml_error.
+    // -------------------------------------------------------------------------
+    const LABELS_MAX = 50;
+    app.get(p('/v1/orders/labels'), authAccount, async (req, res) => {
+        const formato = String(req.query.formato || 'pdf').trim().toLowerCase();
+        if (formato !== 'pdf' && formato !== 'zpl') {
+            return res.status(400).json({ ok: false, error: 'bad_request', message: 'El formato tiene que ser pdf o zpl.' });
+        }
+        const pedidos = [...new Set(String(req.query.ml_order_ids || '').split(',').map((s) => s.trim()).filter(Boolean))];
+        if (!pedidos.length) {
+            return res.status(400).json({ ok: false, error: 'bad_request', message: 'Falta ml_order_ids.' });
+        }
+        if (pedidos.length > LABELS_MAX) {
+            return res.status(400).json({ ok: false, error: 'too_many', max: LABELS_MAX, message: `Se pueden pedir hasta ${LABELS_MAX} etiquetas por vez.` });
+        }
+        const faltaron = [];
+        const validos = [];
+        for (const id of pedidos) {
+            if (/^\d{1,20}$/.test(id)) validos.push(id);
+            else faltaron.push({ ml_order_id: id.slice(0, 32), motivo: 'id_invalido' });
+        }
+        // envío → órdenes (las de un mismo carrito comparten el envío: una etiqueta).
+        const porEnvio = new Map();
+        try {
+            if (validos.length) {
+                const r = await query(
+                    `SELECT ml_order_id, shipment_id::text AS shipment_id,
+                            order_json->'shipping'->>'id' AS ship_raw,
+                            COALESCE(shipment_json->>'logistic_type', shipment_json->'logistic'->>'type', '') AS logistic
+                     FROM order_snapshots
+                     WHERE account_id = $1 AND ml_order_id = ANY($2::varchar[])`,
+                    [req.account.id, validos]
+                );
+                const filas = new Map(r.rows.map((row) => [String(row.ml_order_id), row]));
+                for (const id of validos) {
+                    const row = filas.get(id);
+                    if (!row) { faltaron.push({ ml_order_id: id, motivo: 'no_encontrada' }); continue; }
+                    let envio = row.shipment_id ? String(row.shipment_id) : '';
+                    if (!envio && /^\d+$/.test(String(row.ship_raw || ''))) envio = String(row.ship_raw);
+                    if (!envio) { faltaron.push({ ml_order_id: id, motivo: 'sin_envio' }); continue; }
+                    if (String(row.logistic || '') === 'fulfillment') { faltaron.push({ ml_order_id: id, motivo: 'full' }); continue; }
+                    if (!porEnvio.has(envio)) porEnvio.set(envio, []);
+                    porEnvio.get(envio).push(id);
+                }
+            }
+        } catch (err) {
+            console.error('[v1/orders/labels] db error:', err.message);
+            return res.status(500).json({ ok: false, error: 'db_error', message: 'No se pudieron leer las órdenes.' });
+        }
+        if (!porEnvio.size) {
+            return res.status(422).json({ ok: false, error: 'sin_etiquetas', message: 'Ninguna de las ventas tiene una etiqueta de Mercado Envíos para imprimir.', faltaron });
+        }
+
+        const tipoMl = formato === 'zpl' ? 'zpl2' : 'pdf';
+        let envios = [...porEnvio.keys()];
+        let resp = null;
+        try {
+            const token = await getValidAccessToken(req.account);
+            for (let intento = 0; intento < 2 && envios.length; intento++) {
+                resp = await mlGetShipmentLabels(req.account, token, envios, tipoMl);
+                if (resp.ok && resp.buf && resp.buf.length) break;
+                // ML rechazó el lote: si nombra envíos puntuales, afuera y una vez más con el resto.
+                const texto = resp.buf ? resp.buf.toString('utf8').slice(0, 20000) : '';
+                const nombrados = envios.filter((s) => new RegExp('(^|\\D)' + s + '(\\D|$)').test(texto));
+                if (resp.status >= 500 || !nombrados.length || nombrados.length === envios.length || intento === 1) {
+                    resp = { ...resp, ok: false };
+                    break;
+                }
+                for (const s of nombrados) {
+                    for (const id of porEnvio.get(s)) faltaron.push({ ml_order_id: id, motivo: 'no_imprimible' });
+                    porEnvio.delete(s);
+                }
+                envios = [...porEnvio.keys()];
+            }
+        } catch (err) {
+            console.error('[v1/orders/labels] error:', err.message);
+            resp = null;
+        }
+        if (!resp || !resp.ok || !resp.buf || !resp.buf.length) {
+            const motivo = resp && resp.status >= 400 && resp.status < 500 ? 'no_imprimible' : 'ml_error';
+            for (const s of envios) for (const id of porEnvio.get(s)) faltaron.push({ ml_order_id: id, motivo });
+            return res.status(502).json({ ok: false, error: 'label_unavailable', message: 'Mercado Libre no entregó las etiquetas (envíos Full, ya despachados o todavía no imprimibles).', faltaron });
+        }
+        const buf = resp.buf;
+        let tipo = '';
+        if (formato === 'pdf') {
+            if (buf.length >= 5 && buf.subarray(0, 4).toString() === '%PDF') tipo = 'pdf';
+        } else if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) {
+            tipo = 'zip';   // ML entrega el ZPL como un ZIP con el .txt adentro
+        } else if (buf.subarray(0, 4096).toString('latin1').includes('^XA')) {
+            tipo = 'zpl';
+        }
+        if (!tipo) {
+            for (const s of envios) for (const id of porEnvio.get(s)) faltaron.push({ ml_order_id: id, motivo: 'ml_error' });
+            return res.status(502).json({ ok: false, error: formato === 'pdf' ? 'label_not_pdf' : 'label_not_zpl', message: 'Mercado Libre no entregó las etiquetas en el formato pedido todavía. Probá de nuevo en unos minutos.', faltaron });
+        }
+        const incluidos = [];
+        for (const s of envios) incluidos.push(...porEnvio.get(s));
+        return res.json({ ok: true, formato, tipo, archivo_b64: buf.toString('base64'), incluidos, faltaron });
     });
 
     // =========================================================================

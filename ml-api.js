@@ -193,6 +193,25 @@ export async function mlGetShipmentLabel(account, accessToken, shipmentId) {
 }
 
 /**
+ * Etiquetas de Mercado Envíos EN LOTE (v2.10.3): un solo pedido a ML con todos
+ * los envíos.
+ *   GET /shipment_labels?shipment_ids=a,b,c&response_type=pdf|zpl2
+ *
+ * No tira: devuelve lo que contestó ML para que la ruta decida (un PDF con
+ * todas, el ZPL —texto o un ZIP con el .txt adentro— o el error de ML, que
+ * puede nombrar los envíos que no se pueden imprimir).
+ *
+ * @param {string[]} shipmentIds ids numéricos (la ruta ya los validó).
+ * @param {'pdf'|'zpl2'} responseType
+ * @returns {Promise<{ ok: boolean, status: number, buf: Buffer, contentType: string }>}
+ */
+export async function mlGetShipmentLabels(account, accessToken, shipmentIds, responseType) {
+    const ids = shipmentIds.map((s) => encodeURIComponent(String(s))).join(',');
+    const tipo = responseType === 'zpl2' ? 'zpl2' : 'pdf';
+    return mlGetRaw(account, `/shipment_labels?shipment_ids=${ids}&response_type=${tipo}`, accessToken);
+}
+
+/**
  * Lista los IDs de items del seller, paginado.
  *   GET /users/{uid}/items/search?offset=&limit=[&orders=]
  *
