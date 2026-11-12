@@ -267,6 +267,7 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             assert.equal(v.datos.ok, true, JSON.stringify(v.datos));
             assert.equal(v.datos.n, n);
             assert.equal(v.datos.cuenta, 'VENDEDOR_PRUEBA');
+            assert.equal(v.datos.usuario, '777001');
             assert.equal(v.datos.v, '/admin/mercadolibre/conexion');
             assert.equal(F.ml.ultimaAutorizacion.client_id, 'APPML');
             assert.equal(F.ml.ultimaAutorizacion.redirect_uri, `${CENTRAL}/cuevaweb/ml/volver`);

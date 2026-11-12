@@ -708,7 +708,8 @@ export function montarCuevaweb(app) {
                     [t.id, servicio, x.usuario, x.nombre, x.sitio, x.clavePublica, x.produccion, a.enc, a.iv, r.enc, r.iv, x.vence.toISOString(), fila.nonce]
                 );
             });
-            return volver({ ok: true, cuenta: x.nombre || x.usuario });
+            // `usuario`: la tienda revisa ANTES de confirmar si tiene guardado lo de otra cuenta (no se mezcla)
+            return volver({ ok: true, cuenta: x.nombre || x.usuario, usuario: x.usuario });
         } catch (e) {
             if (!(e instanceof Problema)) console.error(`[cuevaweb] volver de ${servicio}:`, e.message);
             return volver({ ok: false, error: e instanceof Problema ? e.message : `No pudimos terminar la conexión con ${NOMBRE[servicio]}. Probá de nuevo en un rato.` });
