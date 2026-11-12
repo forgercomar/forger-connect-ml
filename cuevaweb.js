@@ -29,15 +29,21 @@
  *   GET  /cuevaweb/conectar?t=&d=&f=        el botón de la tienda: al OAuth de Mercado Libre o de Mercado Pago
  *   GET  /cuevaweb/ml/volver, /mp/volver    la vuelta del OAuth (las «Redirect URI» de las dos apps)
  *   POST /cuevaweb/mp/avisos[?t=]           las notificaciones de Mercado Pago (las de Mercado Libre llegan a /webhooks)
- *   tienda: POST v1/confirmar · GET v1/estado · GET v1/ml/token · GET v1/mp/token (?forzar=1) · POST v1/desconectar
- *           GET v1/avisos · POST v1/avisos/ack
+ *   tienda: POST v1/confirmar · GET v1/estado · GET v1/ml/token · GET v1/mp/token (?forzar=1&actual=<huella del suyo>)
+ *           POST v1/desconectar · GET v1/avisos · POST v1/avisos/ack
  *   panel:  GET panel/estado · PUT|GET|DELETE panel/tiendas/:id · POST panel/tiendas/:id/mp/renovar
  *
+ * (12/11/2026, la revisión) La clave que el panel le da a conectar NO es la CUEVAWEB_CLAVE de la tienda sino una derivada
+ * (HMAC(CUEVAWEB_CLAVE, "cuevaweb-conectar.v1"): src/lib/cuevaweb/plataforma.ts de CUEVAWEB). Con ella la tienda sólo acepta
+ * los avisos de conectar; su API privada, el soporte y «Continuar con Google» siguen pidiendo la de verdad. Acá no cambia
+ * nada: para conectar, «la clave de la tienda» es ésa.
+ *
  * Variables: CUEVAWEB_MODO=1, CUEVAWEB_CONECTAR_CLAVE (la misma en el panel), ML_CLIENT_ID/ML_CLIENT_SECRET y
- * MP_CLIENT_ID/MP_CLIENT_SECRET (las apps de CuevaWeb), BASE_URL (https://conectar.cuevaweb.com.ar), WFML_TOKEN_KEY;
- * opcionales: MP_WEBHOOK_SECRET (la clave de los webhooks de la app de Mercado Pago), CUEVAWEB_MP_RENOVAR_DIAS (30).
- * Para los bancos: CUEVAWEB_ML_API_URL, CUEVAWEB_MP_API_URL, ML_AUTH_DOMAIN, MP_AUTH_DOMAIN, MP_TOKEN_URL,
- * CUEVAWEB_AVISOS_CADA_MS y CUEVAWEB_RENOVAR_CADA_MS.
+ * MP_CLIENT_ID/MP_CLIENT_SECRET (las apps de CuevaWeb), BASE_URL (https://conectar.cuevaweb.com.ar), WFML_TOKEN_KEY,
+ * MP_WEBHOOK_SECRET (la clave de los webhooks de la app de Mercado Pago: sin ella los avisos de pago se rechazan);
+ * opcional: CUEVAWEB_MP_RENOVAR_DIAS (30).
+ * Para los bancos: CUEVAWEB_ML_API_URL, CUEVAWEB_MP_API_URL, ML_AUTH_DOMAIN, MP_AUTH_DOMAIN, MP_TOKEN_URL (sólo valen
+ * si son de esta máquina: localhost o 127.0.0.1), CUEVAWEB_AVISOS_CADA_MS y CUEVAWEB_RENOVAR_CADA_MS.
  */
 
 import crypto from 'node:crypto';
@@ -54,6 +60,28 @@ export function cuevawebActivo() {
 
 const sinBarra = (u) => String(u || '').replace(/\/+$/, '');
 
+/** (12/11/2026, la revisión) Las direcciones de Mercado Libre y de Mercado Pago se cambian SÓLO para los bancos: un Mercado
+ *  Libre y un Mercado Pago de mentira en ESTA máquina (localhost, 127.0.0.1). Cualquier otra dirección (salvo las de
+ *  verdad, con https) se ignora y se usa la de fábrica: un valor de prueba que quedó en el Entorno nunca recibe las claves
+ *  de las apps de CuevaWeb ni los permisos de las tiendas. Se avisa una vez en el registro. */
+const DE_ESTA_MAQUINA = new Set(['localhost', '127.0.0.1', '[::1]']);
+const DE_VERDAD = /(^|\.)(mercadolibre|mercadopago)\.com(\.[a-z]{2})?$/;
+const ignoradas = new Set();
+export function direccionDePrueba(nombre, deFabrica) {
+    const v = String(process.env[nombre] || '').trim();
+    if (!v) return deFabrica;
+    try {
+        const u = new URL(v);
+        if ((u.protocol === 'http:' || u.protocol === 'https:') && DE_ESTA_MAQUINA.has(u.hostname)) return v;
+        if (u.protocol === 'https:' && DE_VERDAD.test(u.hostname)) return v;
+    } catch (_) { /* no es una dirección */ }
+    if (!ignoradas.has(nombre)) {
+        ignoradas.add(nombre);
+        console.warn(`[cuevaweb] ${nombre} no es una dirección de esta máquina ni de Mercado Libre / Mercado Pago: se ignora (es sólo para los bancos) y se usa ${deFabrica}.`);
+    }
+    return deFabrica;
+}
+
 function conf() {
     const e = process.env;
     const base = sinBarra(e.BASE_URL);
@@ -62,16 +90,16 @@ function conf() {
         ml: {
             clientId: (e.ML_CLIENT_ID || '').trim(),
             secret: (e.ML_CLIENT_SECRET || '').trim(),
-            auth: sinBarra(e.ML_AUTH_DOMAIN || 'https://auth.mercadolibre.com.ar'),
-            api: sinBarra(e.CUEVAWEB_ML_API_URL || 'https://api.mercadolibre.com'),
+            auth: sinBarra(direccionDePrueba('ML_AUTH_DOMAIN', 'https://auth.mercadolibre.com.ar')),
+            api: sinBarra(direccionDePrueba('CUEVAWEB_ML_API_URL', 'https://api.mercadolibre.com')),
             vuelta: `${base}/cuevaweb/ml/volver`,
         },
         mp: {
             clientId: (e.MP_CLIENT_ID || '').trim(),
             secret: (e.MP_CLIENT_SECRET || '').trim(),
-            auth: sinBarra(e.MP_AUTH_DOMAIN || 'https://auth.mercadopago.com'),
-            token: e.MP_TOKEN_URL || 'https://api.mercadopago.com/oauth/token',
-            api: sinBarra(e.CUEVAWEB_MP_API_URL || 'https://api.mercadopago.com'),
+            auth: sinBarra(direccionDePrueba('MP_AUTH_DOMAIN', 'https://auth.mercadopago.com')),
+            token: direccionDePrueba('MP_TOKEN_URL', 'https://api.mercadopago.com/oauth/token'),
+            api: sinBarra(direccionDePrueba('CUEVAWEB_MP_API_URL', 'https://api.mercadopago.com')),
             scopes: e.MP_SCOPES || 'read write offline_access',
             vuelta: `${base}/cuevaweb/mp/volver`,
             webhookSecret: (e.MP_WEBHOOK_SECRET || '').trim(),
@@ -90,6 +118,11 @@ const servicioListo = (s) => {
 };
 /** Más de esto, un aviso que no se pudo entregar queda para que la tienda lo traiga (ya no se reintenta solo). */
 const MAX_INTENTOS = 12;
+/** (12/11/2026, la revisión) Las veces que la tienda puede traer un aviso sin poder hacerlo (con esperas cada vez más
+ *  largas entre una y otra: más o menos un día y medio); después, y a los 7 días de haber llegado, se DESCARTA: uno que la
+ *  tienda no puede hacer nunca (un pago de otra cuenta, Mercado Pago ya desconectado) no tapa a los nuevos. */
+const MAX_TRAIDAS = 12;
+const DIAS_PARA_DESCARTAR = 7;
 
 // ─────────────────────────────────────────────────────────────── las firmas
 
@@ -318,11 +351,21 @@ function renovar(conexion, { forzar = false, margenMs = 0, evitarRepetir = false
     return p;
 }
 
+/** La huella de un token (la tienda manda la del suyo al pedir uno forzado: así se sabe si el que falló es el de acá) */
+export const huellaDeToken = (token) => huella(`cuevaweb-token:${token}`).slice(0, 22);
+
 /** Un token vigente: Mercado Libre se renueva si le quedan menos de 15 minutos; Mercado Pago, si le queda menos de un día
- *  (normalmente lo renueva antes la vuelta de cada hora, a los 30 días de vencer). */
-async function tokenVigente(conexion, forzar) {
+ *  (normalmente lo renueva antes la vuelta de cada hora, a los 30 días de vencer). Con `forzar` (el token le dio 401 a la
+ *  tienda) se renueva sí o sí, salvo que la tienda diga con `actual` (la huella del suyo) que el que falló no es el de acá:
+ *  entonces la tienda tenía uno viejo y se le da el de ahora, sin gastar otra renovación. */
+async function tokenVigente(conexion, forzarPedido, actual) {
     const margenMs = conexion.servicio === 'ml' ? 15 * 60_000 : 24 * 3_600_000;
     let fila = conexion;
+    let forzar = forzarPedido;
+    if (forzar && actual) {
+        const vigente = descifrar(fila.access_enc, fila.access_iv);
+        if (vigente && !iguales(huellaDeToken(vigente), String(actual))) forzar = false;
+    }
     if (forzar || !fila.vence || new Date(fila.vence).getTime() - Date.now() <= margenMs || !descifrar(fila.access_enc, fila.access_iv)) {
         fila = await renovar(conexion, { forzar, margenMs, evitarRepetir: true });
     }
@@ -360,11 +403,20 @@ const ESPERA_MIN = [1, 2, 5, 10, 30, 60, 120, 240, 360];
 const esperaMin = (intentos) => ESPERA_MIN[Math.min(ESPERA_MIN.length - 1, Math.max(0, intentos - 1))];
 
 /** Guarda un aviso para una tienda y lo manda. El mismo recurso todavía sin entregar no se repite (la tienda lo va a
- *  buscar a Mercado Libre o a Mercado Pago igual: lo que importa es que se entere). */
+ *  buscar a Mercado Libre o a Mercado Pago igual: lo que importa es que se entere). (12/11/2026, la revisión) Lo que llega
+ *  acá ya viene revisado y CHICO (avisoDeMercadoLibre, los avisos de Mercado Pago): por las dudas, un recurso de más de
+ *  200 letras o un cuerpo de más de 2 KB no se guarda. */
 async function avisarTienda(tiendaId, origen, tema, recurso, cuerpo) {
+    const rec = String(recurso || '');
+    const texto = JSON.stringify(cuerpo || {});
+    if (rec.length > 200 || String(tema).length > 64 || texto.length > 2048) {
+        console.warn(`[cuevaweb] un aviso (${origen}) demasiado grande: no se guarda`);
+        return null;
+    }
     const ya = await query(
-        `SELECT id FROM cuevaweb_avisos WHERE tienda_id = $1 AND origen = $2 AND tema = $3 AND recurso = $4 AND entregado IS NULL LIMIT 1`,
-        [tiendaId, origen, tema, String(recurso || '')]
+        `SELECT id FROM cuevaweb_avisos
+          WHERE tienda_id = $1 AND origen = $2 AND tema = $3 AND recurso = $4 AND entregado IS NULL AND descartado IS NULL LIMIT 1`,
+        [tiendaId, origen, tema, rec]
     );
     if (ya.rowCount) {
         programarEntrega(tiendaId);
@@ -372,10 +424,25 @@ async function avisarTienda(tiendaId, origen, tema, recurso, cuerpo) {
     }
     const r = await query(
         `INSERT INTO cuevaweb_avisos (tienda_id, origen, tema, recurso, cuerpo) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-        [tiendaId, origen, tema, String(recurso || '').slice(0, 300), JSON.stringify(cuerpo || {})]
+        [tiendaId, origen, tema, rec, texto]
     );
     programarEntrega(tiendaId);
     return r.rows[0].id;
+}
+
+/** (12/11/2026, la revisión) Los avisos que la tienda no pudo hacer en MAX_TRAIDAS veces (la última, hace más de 6 horas) o
+ *  que tienen más de DIAS_PARA_DESCARTAR días, se descartan (el panel los cuenta). De una tienda o de todas. */
+async function descartarAvisos(tiendaId = null) {
+    await query(
+        `UPDATE cuevaweb_avisos
+            SET descartado = NOW(),
+                error = LEFT(CASE WHEN traidas >= $1::int THEN 'Se descartó: la tienda no lo pudo hacer en ' || traidas::text || ' intentos'
+                                  ELSE 'Se descartó: no se pudo entregar en ' || $2::int::text || ' días' END
+                             || COALESCE(' (' || error || ')', ''), 300)
+          WHERE entregado IS NULL AND descartado IS NULL AND ($3::bigint IS NULL OR tienda_id = $3::bigint)
+            AND ((traidas >= $1::int AND traido <= NOW() - INTERVAL '6 hours') OR recibido < NOW() - make_interval(days => $2::int))`,
+        [MAX_TRAIDAS, DIAS_PARA_DESCARTAR, tiendaId]
+    );
 }
 
 const RUTA_AVISO = '/api/cuevaweb/conectar/aviso';
@@ -395,7 +462,7 @@ async function entregar(tiendaId) {
             if (!clave) return;
             const avisos = (await query(
                 `SELECT id, origen, tema, recurso, cuerpo, recibido, intentos FROM cuevaweb_avisos
-                  WHERE tienda_id = $1 AND entregado IS NULL AND proximo <= NOW() AND intentos < $2
+                  WHERE tienda_id = $1 AND entregado IS NULL AND descartado IS NULL AND proximo <= NOW() AND intentos < $2
                   ORDER BY id LIMIT 20`,
                 [tiendaId, MAX_INTENTOS]
             )).rows;
@@ -444,17 +511,29 @@ async function entregar(tiendaId) {
     }
 }
 
+/** Los tópicos que la tienda hace (src/lib/mercadolibre/avisos.ts): los demás no se le mandan. */
+const TEMAS_ML = new Set(['orders_v2', 'orders', 'questions', 'messages', 'items', 'shipments', 'claims']);
+/** Un recurso de Mercado Libre: «/orders/123», «/items/MLA123/prices», «/messages/abc», «/post-purchase/v1/claims/9»… */
+const RECURSO_ML = /^\/[A-Za-z0-9_\-./?=&%:]{1,199}$/;
+const entero = (v) => (Number.isInteger(v) && v >= 0 && v <= 1_000_000 ? v : undefined);
+const fecha = (v) => (typeof v === 'string' && v.length <= 40 && !Number.isNaN(Date.parse(v)) ? v : undefined);
+
 /** El aviso de Mercado Libre que llegó a /webhooks (server.js, después de su filtro de application_id y de repetidos):
- *  si el vendedor es de una tienda de CuevaWeb, se le reenvía. Todos los tópicos (también «claims»). */
+ *  si el vendedor es de una tienda de CuevaWeb, se le reenvía. Los tópicos que la tienda hace (también «claims»).
+ *  (12/11/2026, la revisión) Mercado Libre no firma sus avisos y /webhooks es público: sólo se guarda lo que se espera,
+ *  revisado y con tope (el tópico de la lista, un recurso de hasta 200 letras, los números como números); nada más del
+ *  cuerpo viaja. La tienda nunca le cree al aviso: con el recurso le pregunta a Mercado Libre. */
 export async function avisoDeMercadoLibre(body) {
     if (!cuevawebActivo()) return false;
-    const b = body || {};
-    const topic = String(b.topic || '');
-    const resource = String(b.resource || '');
+    const b = body && typeof body === 'object' ? body : {};
+    const topic = typeof b.topic === 'string' ? b.topic : '';
+    const resource = typeof b.resource === 'string' ? b.resource : '';
     const userId = b.user_id != null ? String(b.user_id) : '';
-    if (!topic || !resource || !/^\d+$/.test(userId)) return false;
+    if (!TEMAS_ML.has(topic) || !RECURSO_ML.test(resource) || !/^\d{1,20}$/.test(userId)) return false;
+    const appId = b.application_id != null ? String(b.application_id) : '';
+    if (appId && !/^[A-Za-z0-9_-]{1,40}$/.test(appId)) return false;
     const c = conf();
-    if (c.ml.clientId && b.application_id != null && String(b.application_id) !== c.ml.clientId) return false;
+    if (c.ml.clientId && appId && appId !== c.ml.clientId) return false;
     const r = await query(
         `SELECT c.tienda_id FROM cuevaweb_conexiones c JOIN cuevaweb_tiendas t ON t.id = c.tienda_id
           WHERE c.servicio = 'ml' AND c.estado = 'activa' AND c.usuario_id = $1 AND t.baja IS NULL`,
@@ -462,15 +541,18 @@ export async function avisoDeMercadoLibre(body) {
     );
     if (!r.rowCount) return false;
     const cuerpo = {
-        _id: b._id != null ? String(b._id) : undefined, topic, resource, user_id: Number(userId),
-        application_id: b.application_id != null ? Number(b.application_id) : undefined,
-        attempts: b.attempts, sent: b.sent, received: b.received,
+        _id: typeof b._id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(b._id) ? b._id : undefined,
+        topic, resource, user_id: Number(userId),
+        // el App ID como texto: los de Mercado Libre tienen 16 cifras y como número pueden perder la última
+        application_id: appId || undefined,
+        attempts: entero(b.attempts), sent: fecha(b.sent), received: fecha(b.received),
     };
     for (const row of r.rows) await avisarTienda(row.tienda_id, 'ml', topic, resource, cuerpo);
     return true;
 }
 
-/** ¿La firma del aviso de Mercado Pago (x-signature) es de la app de CuevaWeb? (la misma regla que la tienda) */
+/** ¿La firma del aviso de Mercado Pago (x-signature) es de la app de CuevaWeb? (la misma cuenta que hace la tienda en
+ *  src/lib/payments/mercadopago.ts; y la misma regla: sólo pasa 'valida') */
 function firmaMp(req, dataId) {
     const secreto = conf().mp.webhookSecret;
     if (!secreto) return 'sin_clave';
@@ -498,7 +580,7 @@ function firmaMp(req, dataId) {
 async function reintentarEntregas() {
     const r = await query(
         `SELECT DISTINCT a.tienda_id FROM cuevaweb_avisos a JOIN cuevaweb_tiendas t ON t.id = a.tienda_id
-          WHERE a.entregado IS NULL AND a.proximo <= NOW() AND a.intentos < $1 AND t.baja IS NULL`,
+          WHERE a.entregado IS NULL AND a.descartado IS NULL AND a.proximo <= NOW() AND a.intentos < $1 AND t.baja IS NULL`,
         [MAX_INTENTOS]
     );
     for (const row of r.rows) programarEntrega(row.tienda_id, 10);
@@ -531,6 +613,7 @@ export async function renovarMercadoPagoPorVencer() {
 async function limpiar() {
     await query(`DELETE FROM cuevaweb_estados WHERE creado < NOW() - INTERVAL '1 hour'`);
     await query(`DELETE FROM cuevaweb_conexiones WHERE estado = 'pendiente' AND conectada < NOW() - INTERVAL '2 hours'`);
+    await descartarAvisos();
     await query(`DELETE FROM cuevaweb_avisos WHERE recibido < NOW() - INTERVAL '30 days'`);
 }
 
@@ -596,9 +679,14 @@ function urlValida(u) {
 async function estadoDeTienda(t) {
     const [conexiones, avisos, ultimo, error] = await Promise.all([
         query(`SELECT * FROM cuevaweb_conexiones WHERE tienda_id = $1 AND estado = 'activa'`, [t.id]),
-        query(`SELECT COUNT(*)::int AS n FROM cuevaweb_avisos WHERE tienda_id = $1 AND entregado IS NULL`, [t.id]),
+        query(
+            `SELECT COUNT(*) FILTER (WHERE entregado IS NULL AND descartado IS NULL)::int AS n,
+                    COUNT(*) FILTER (WHERE descartado > NOW() - INTERVAL '7 days')::int AS descartados
+               FROM cuevaweb_avisos WHERE tienda_id = $1`,
+            [t.id]
+        ),
         query(`SELECT MAX(entregado) AS en FROM cuevaweb_avisos WHERE tienda_id = $1`, [t.id]),
-        query(`SELECT error, proximo, recibido FROM cuevaweb_avisos WHERE tienda_id = $1 AND entregado IS NULL AND error IS NOT NULL ORDER BY id DESC LIMIT 1`, [t.id]),
+        query(`SELECT error, proximo, recibido FROM cuevaweb_avisos WHERE tienda_id = $1 AND entregado IS NULL AND descartado IS NULL AND error IS NOT NULL ORDER BY id DESC LIMIT 1`, [t.id]),
     ]);
     const de = (s) => {
         const c = conexiones.rows.find((x) => x.servicio === s);
@@ -611,7 +699,10 @@ async function estadoDeTienda(t) {
     return {
         registrada: !t.baja, url: t.url, nombre: t.nombre, actualizada: t.actualizada,
         ml: de('ml'), mp: de('mp'),
-        avisos: { pendientes: avisos.rows[0].n, ultimoEntregado: ultimo.rows[0].en, ultimoError: error.rows[0] ? { texto: error.rows[0].error, recibido: error.rows[0].recibido } : null },
+        avisos: {
+            pendientes: avisos.rows[0].n, descartados: avisos.rows[0].descartados, ultimoEntregado: ultimo.rows[0].en,
+            ultimoError: error.rows[0] ? { texto: error.rows[0].error, recibido: error.rows[0].recibido } : null,
+        },
     };
 }
 
@@ -717,34 +808,42 @@ export function montarCuevaweb(app) {
     });
 
     // ── los avisos de Mercado Pago ───────────────────────────────────────────────────────────────────────────────
+    // (12/11/2026, la revisión) La MISMA regla que el aviso directo de la tienda (src/app/api/webhooks/mercadopago): sólo
+    // los pagos, y sólo con la firma de la app de CuevaWeb VÁLIDA (sin MP_WEBHOOK_SECRET, o sin x-signature, o con una mala:
+    // 401 y no se guarda nada). Se revisa ANTES de contestar. No se pierde ningún cobro: la tienda igual le pregunta a
+    // Mercado Pago por los pedidos que esperan el pago (cada media hora) y por el de la vuelta de quien pagó.
     app.post('/cuevaweb/mp/avisos', limiteAvisosMp, (req, res) => {
+        const b = req.body && typeof req.body === 'object' ? req.body : {};
+        const q = req.query || {};
+        const tipo = String(b.type || b.topic || uno(q.type) || uno(q.topic) || '');
+        const idDeLaUrl = uno(q['data.id']);
+        const dataId = String(idDeLaUrl || (b.data && typeof b.data === 'object' ? b.data.id : '') || uno(q.id) || '');
+        if (tipo !== 'payment' || !/^[A-Za-z0-9_-]{1,64}$/.test(dataId)) return responder(res, 200, { ok: true, ignorado: true });
+        const firma = firmaMp(req, idDeLaUrl ? String(idDeLaUrl) : dataId);
+        if (firma !== 'valida') {
+            console.warn(`[cuevaweb] aviso de Mercado Pago ${firma === 'sin_clave' ? 'sin MP_WEBHOOK_SECRET en conectar' : firma === 'sin_firma' ? 'sin firma' : 'con firma inválida'}: no se reenvía`);
+            return responder(res, 401, { ok: false, error: firma === 'sin_clave' ? 'sin_clave' : 'firma_invalida' });
+        }
         res.status(200).json({ ok: true }); // enseguida: Mercado Pago reintenta lo que tarda
         (async () => {
-            const b = req.body || {};
-            const q = req.query || {};
-            const tipo = String(b.type || b.topic || uno(q.type) || uno(q.topic) || '');
-            const dataId = String(uno(q['data.id']) || (b.data && b.data.id) || uno(q.id) || '');
-            if (!tipo || !/^[A-Za-z0-9_-]{1,64}$/.test(dataId)) return;
-            const firma = firmaMp(req, dataId);
-            if (firma === 'mala') {
-                console.warn('[cuevaweb] aviso de Mercado Pago con firma inválida: no se reenvía');
-                return;
-            }
             let tienda = null;
             const porT = uno(q.t) ? await tiendaPorClaveId(uno(q.t)) : null;
             if (porT && (await conexionActiva(porT.id, 'mp'))) tienda = porT;
-            if (!tienda && b.user_id != null) {
+            const usuario = b.user_id != null && /^\d{1,20}$/.test(String(b.user_id)) ? String(b.user_id) : '';
+            if (!tienda && usuario) {
                 const r = await query(
                     `SELECT c.tienda_id FROM cuevaweb_conexiones c JOIN cuevaweb_tiendas t ON t.id = c.tienda_id
                       WHERE c.servicio = 'mp' AND c.estado = 'activa' AND c.usuario_id = $1 AND t.baja IS NULL LIMIT 1`,
-                    [String(b.user_id)]
+                    [usuario]
                 );
                 if (r.rowCount) tienda = { id: r.rows[0].tienda_id };
             }
             if (!tienda) return;
+            // sólo lo que hace falta, revisado (la tienda lee el pago de Mercado Pago con su token: no le cree al aviso)
+            const accion = typeof b.action === 'string' && /^[a-z_.]{1,40}$/i.test(b.action) ? b.action : undefined;
             await avisarTienda(tienda.id, 'mp', tipo, dataId, {
-                type: tipo, action: b.action ? String(b.action) : undefined, data: { id: dataId },
-                user_id: b.user_id != null ? String(b.user_id) : undefined, live_mode: typeof b.live_mode === 'boolean' ? b.live_mode : undefined,
+                type: tipo, action: accion, data: { id: dataId },
+                user_id: usuario || undefined, live_mode: typeof b.live_mode === 'boolean' ? b.live_mode : undefined,
             });
         })().catch((e) => console.error('[cuevaweb] aviso de Mercado Pago:', e.message));
     });
@@ -788,7 +887,8 @@ export function montarCuevaweb(app) {
         try {
             const c = await conexionActiva(req.tienda.id, servicio);
             if (!c) return responder(res, 404, { ok: false, error: 'no_conectada', message: `${NOMBRE[servicio]} no está conectado a esta tienda.` });
-            const { fila, token } = await tokenVigente(c, String(uno(req.query.forzar) || '') === '1');
+            const actual = String(uno(req.query.actual) || '');
+            const { fila, token } = await tokenVigente(c, String(uno(req.query.forzar) || '') === '1', /^[A-Za-z0-9_-]{8,64}$/.test(actual) ? actual : '');
             return responder(res, 200, credenciales(fila, token));
         } catch (e) {
             if (e instanceof Reconectar) return responder(res, 409, { ok: false, error: 'reconectar', message: e.message });
@@ -808,16 +908,31 @@ export function montarCuevaweb(app) {
         }
     });
 
+    // (12/11/2026, la revisión) Los avisos sin entregar que la tienda viene a buscar. Primero los que nunca se llevó; cada
+    // vez que se lleva uno y no lo confirma (no lo pudo hacer), vuelve recién después de una espera cada vez más larga
+    // (1, 2, 5, 10, 30 minutos… hasta 6 horas) y, pasadas MAX_TRAIDAS veces, se descarta: uno que no se puede hacer nunca
+    // no tapa a los nuevos ni hace que la tienda le pregunte lo mismo a Mercado Pago cada media hora durante un mes.
     app.get('/cuevaweb/v1/avisos', autenticarTienda, async (req, res) => {
         try {
             const limite = Math.min(100, Math.max(1, Number(uno(req.query.limite)) || 50));
+            await descartarAvisos(req.tienda.id);
             const r = await query(
-                `SELECT id, origen, tema, recurso, cuerpo, recibido FROM cuevaweb_avisos
-                  WHERE tienda_id = $1 AND entregado IS NULL ORDER BY id LIMIT $2`,
+                `WITH elegidos AS (
+                    SELECT id FROM cuevaweb_avisos
+                     WHERE tienda_id = $1 AND entregado IS NULL AND descartado IS NULL
+                       AND (traido IS NULL OR traido <= NOW() - make_interval(mins => (ARRAY[1,2,5,10,30,60,120,240,360])[LEAST(9, GREATEST(1, traidas))]))
+                     ORDER BY traidas, id
+                     LIMIT $2
+                     FOR UPDATE SKIP LOCKED)
+                 UPDATE cuevaweb_avisos a SET traidas = a.traidas + 1, traido = NOW()
+                   FROM elegidos e WHERE a.id = e.id
+                 RETURNING a.id, a.origen, a.tema, a.recurso, a.cuerpo, a.recibido`,
                 [req.tienda.id, limite]
             );
-            return responder(res, 200, { ok: true, avisos: r.rows.map((a) => ({ id: String(a.id), origen: a.origen, tema: a.tema, recurso: a.recurso, cuerpo: a.cuerpo, recibido: a.recibido })) });
+            const avisos = r.rows.sort((x, y) => Number(x.id) - Number(y.id));
+            return responder(res, 200, { ok: true, avisos: avisos.map((a) => ({ id: String(a.id), origen: a.origen, tema: a.tema, recurso: a.recurso, cuerpo: a.cuerpo, recibido: a.recibido })) });
         } catch (e) {
+            console.error('[cuevaweb] los avisos de una tienda:', e.message);
             return responder(res, 500, { ok: false, error: 'interno' });
         }
     });
@@ -937,6 +1052,9 @@ export function montarCuevaweb(app) {
     if (primero.unref) primero.unref();
 
     console.log(`[cuevaweb] modo CuevaWeb ACTIVO: Mercado Libre ${servicioListo('ml') ? 'listo' : 'sin configurar'}, Mercado Pago ${servicioListo('mp') ? 'listo' : 'sin configurar'}, panel ${c.claveDelPanel.length >= 32 ? 'con clave' : 'SIN CUEVAWEB_CONECTAR_CLAVE'}.`);
+    if (servicioListo('mp') && !c.mp.webhookSecret) {
+        console.warn('[cuevaweb] falta MP_WEBHOOK_SECRET: los avisos de pago de Mercado Pago se rechazan (las tiendas igual preguntan por sus pagos cada media hora).');
+    }
 }
 
 /** Vuelve a la tienda (/api/conectar/vuelta) con lo que pasó, firmado con su clave. */

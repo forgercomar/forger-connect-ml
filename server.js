@@ -275,6 +275,16 @@ app.use((req, res, next) => {
 // el re-stringify de express.json() podría no matchear bit a bit con lo que
 // el cliente firmó (orden de keys, espacios, etc.).
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
+// (12/11/2026) El modo CuevaWeb: lo que llega a /cuevaweb/* es chico (los avisos de Mercado Pago, los pedidos de las
+// tiendas y del panel): con un tope de 64 KB, uno gigante ni se lee (413). Sin el modo, no se monta.
+if (CUEVAWEB_ON) {
+    app.use('/cuevaweb', express.json({
+        limit: '64kb',
+        verify: (req, _res, buf) => {
+            req.rawBody = buf && buf.length ? buf.toString('utf8') : '';
+        },
+    }));
+}
 app.use(express.json({
     limit: '16mb', // v1/jobs con miles de items necesita más (push masivo de un seller de ~5.000 publicaciones: varios MB)
     verify: (req, _res, buf) => {

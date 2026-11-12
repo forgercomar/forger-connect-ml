@@ -26,6 +26,17 @@
  *   C10 la renovación sola: con menos de 30 días para vencer, se renueva sin que nadie lo pida
  *   C11 otra tienda no puede conectar la MISMA cuenta de Mercado Libre
  *   C12 desconectar: el token ya no se da (404); la baja del panel: la tienda ya no entra (401)
+ *   (12/11/2026, la revisión)
+ *   C13 el token forzado con `actual`: si el que falló no es el de acá (la tienda tenía uno viejo), no se gasta otra
+ *       renovación; si es el de acá, se renueva
+ *   C14 los avisos de Mercado Libre, revisados y con tope: un recurso gigante, un tópico raro o un usuario que no es un
+ *       número no se guardan; del cuerpo sólo viaja lo esperado (el App ID como texto)
+ *   C15 los avisos que trae la tienda: los nuevos primero; uno traído y no confirmado espera antes de volver; pasadas 12
+ *       veces se descarta (el panel lo cuenta) y no tapa a los demás
+ *   C16 los avisos de Mercado Pago: sin firma, con una mala o sin MP_WEBHOOK_SECRET → 401 y no se guarda nada; otro tipo
+ *       que no es un pago → se ignora; un cuerpo de más de 64 KB → 413
+ *   C17 las direcciones de prueba que no son de esta máquina se ignoran: el dueño va al Mercado Libre y al Mercado Pago
+ *       de verdad
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -53,6 +64,23 @@ const huella = (s) => crypto.createHash('sha256').update(String(s)).digest('base
 const hmac = (clave, texto) => crypto.createHmac('sha256', clave).update(texto).digest('base64url');
 const idDe = (clave) => huella(`cuevaweb-conectar:${clave}`).slice(0, 32);
 const firma = (clave, t, metodo, ruta, cuerpo) => hmac(clave, `${t}.${metodo}.${ruta}.${huella(cuerpo)}`);
+const huellaDeToken = (token) => huella(`cuevaweb-token:${token}`).slice(0, 22);
+const MP_SECRETO = crypto.randomBytes(24).toString('hex');
+// la misma en cada arranque de la central (C17 la reinicia: tiene que poder leer lo que guardó)
+const LLAVE_TOKENS = crypto.randomBytes(32).toString('base64');
+const SECRETO_HUB = azar(32);
+
+/** Un aviso de Mercado Pago como lo manda Mercado Pago: con su x-signature (buena, mala o ninguna) */
+async function avisoMp(query, cuerpo, { firma: f = 'buena', dataId = cuerpo?.data?.id } = {}) {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const rid = crypto.randomUUID();
+    const v1 = crypto.createHmac('sha256', MP_SECRETO).update(`id:${String(dataId).toLowerCase()};request-id:${rid};ts:${ts};`).digest('hex');
+    const h = { 'content-type': 'application/json', 'x-request-id': rid };
+    if (f === 'buena') h['x-signature'] = `ts=${ts},v1=${v1}`;
+    if (f === 'mala') h['x-signature'] = `ts=${ts},v1=${'0'.repeat(64)}`;
+    const r = await fetch(`${CENTRAL}/cuevaweb/mp/avisos?${query}`, { method: 'POST', headers: h, body: typeof cuerpo === 'string' ? cuerpo : JSON.stringify(cuerpo) });
+    return { status: r.status, datos: await r.json().catch(() => null) };
+}
 
 function pgEnv() {
     const u = new URL(URL_DB);
@@ -170,8 +198,8 @@ const db = URL_DB ? new pg.Pool({ connectionString: URL_DB }) : null;
 function arrancarCentral(extra) {
     const env = {
         ...process.env, ...pgEnv(), PORT: String(PC), BASE_URL: CENTRAL, DATA_DIR: path.join(os.tmpdir(), 'cml-cuevaweb-test'),
-        ML_CLIENT_ID: 'APPML', ML_CLIENT_SECRET: 'SECRETOML', WFML_OAUTH_HUB_SECRET: azar(32), WFML_TOKEN_KEY: crypto.randomBytes(32).toString('base64'),
-        MP_CLIENT_ID: 'APPMP', MP_CLIENT_SECRET: 'SECRETOMP',
+        ML_CLIENT_ID: 'APPML', ML_CLIENT_SECRET: 'SECRETOML', WFML_OAUTH_HUB_SECRET: SECRETO_HUB, WFML_TOKEN_KEY: LLAVE_TOKENS,
+        MP_CLIENT_ID: 'APPMP', MP_CLIENT_SECRET: 'SECRETOMP', MP_WEBHOOK_SECRET: MP_SECRETO,
         ML_AUTH_DOMAIN: `${FALSO}/ml`, CUEVAWEB_ML_API_URL: `${FALSO}/ml`,
         MP_AUTH_DOMAIN: `${FALSO}/mp`, MP_TOKEN_URL: `${FALSO}/mp/oauth/token`, CUEVAWEB_MP_API_URL: `${FALSO}/mp`,
         CUEVAWEB_CONECTAR_CLAVE: CLAVE_PANEL, CUEVAWEB_AVISOS_CADA_MS: '1000', CUEVAWEB_RENOVAR_CADA_MS: '1500',
@@ -310,6 +338,22 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             assert.equal(F.ml.renovaciones, 1);
         });
 
+        await t.test('C13 el token forzado con `actual`: sólo se renueva si el que falló es el de acá', async () => {
+            // fuera de los 20 segundos de «recién renovado»
+            await db.query(`UPDATE cuevaweb_conexiones SET renovada = NOW() - INTERVAL '5 minutes' WHERE servicio = 'ml' AND estado = 'activa'`);
+            const ahora = F.ml.access;
+            const viejo = await pedir('GET', `/cuevaweb/v1/ml/token?forzar=1&actual=${huellaDeToken('APP_USR-uno-viejo-que-ya-no-sirve')}`, { clave: CLAVE_A, tienda: CLAVE_A });
+            assert.equal(viejo.status, 200);
+            assert.equal(viejo.datos.access_token, ahora, 'la tienda tenía uno viejo: se le da el de ahora');
+            assert.equal(F.ml.renovaciones, 1, 'sin gastar otra renovación');
+            const esteFallo = await pedir('GET', `/cuevaweb/v1/ml/token?forzar=1&actual=${huellaDeToken(ahora)}`, { clave: CLAVE_A, tienda: CLAVE_A });
+            assert.equal(esteFallo.status, 200);
+            assert.equal(F.ml.renovaciones, 2, 'el que falló es el de acá: se renueva');
+            assert.notEqual(esteFallo.datos.access_token, ahora);
+            assert.equal(esteFallo.datos.access_token, F.ml.access);
+            tokenMl = esteFallo.datos.access_token;
+        });
+
         await t.test('C6 un aviso de Mercado Libre llega a la tienda, firmado', async () => {
             const w = await fetch(`${CENTRAL}/webhooks`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ _id: 'aviso-1', topic: 'orders_v2', resource: '/orders/2000001', user_id: 777001, application_id: 'APPML' }) });
             assert.equal(w.status, 200);
@@ -324,6 +368,27 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             await fetch(`${CENTRAL}/webhooks`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ _id: 'aviso-2', topic: 'orders_v2', resource: '/orders/9', user_id: 777001, application_id: 'OTRA' }) });
             await espera(800);
             assert.equal((await db.query(`SELECT COUNT(*)::int AS n FROM cuevaweb_avisos WHERE recurso = '/orders/9'`)).rows[0].n, 0);
+        });
+
+        await t.test('C14 los avisos de Mercado Libre, revisados y con tope', async () => {
+            const mandar = (b) => fetch(`${CENTRAL}/webhooks`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) });
+            const gigante = `/orders/1${'A'.repeat(300_000)}`;
+            for (const b of [
+                { _id: 'aviso-g1', topic: 'orders_v2', resource: gigante, user_id: 777001, application_id: 'APPML' },
+                { _id: 'aviso-g2', topic: 'x'.repeat(5000), resource: '/orders/31', user_id: 777001, application_id: 'APPML' },
+                { _id: 'aviso-g3', topic: 'payments', resource: '/orders/32', user_id: 777001, application_id: 'APPML' },
+                { _id: 'aviso-g4', topic: 'orders_v2', resource: '/orders/33', user_id: '777001 OR 1=1', application_id: 'APPML' },
+                { _id: 'aviso-g5', topic: 'orders_v2', resource: { a: 1 }, user_id: 777001, application_id: 'APPML' },
+            ]) assert.equal((await mandar(b)).status, 200, 'Mercado Libre siempre recibe un 200');
+            // el bueno, con basura alrededor: sólo viaja lo esperado
+            await mandar({ _id: 'z'.repeat(500), topic: 'questions', resource: '/questions/77', user_id: 777001, application_id: 'APPML', attempts: { muchos: 'x'.repeat(10_000) }, sent: 'y'.repeat(5000), received: '2026-11-12T10:00:00.000Z', otro: 'x'.repeat(20_000) });
+            const llego = await hasta(() => T.recibidos.find((a) => a.recurso === '/questions/77'));
+            assert.ok(llego, 'el bueno llegó');
+            assert.deepEqual(Object.keys(llego.cuerpo).sort(), ['application_id', 'received', 'resource', 'topic', 'user_id'], JSON.stringify(llego.cuerpo).slice(0, 300));
+            assert.equal(llego.cuerpo.application_id, 'APPML', 'el App ID como texto');
+            const filas = (await db.query(`SELECT recurso, length(cuerpo::text) AS largo FROM cuevaweb_avisos`)).rows;
+            assert.ok(!filas.some((f) => /^\/orders\/3[123]$/.test(f.recurso) || f.recurso.length > 200), JSON.stringify(filas.map((f) => f.recurso.slice(0, 40))));
+            assert.ok(filas.every((f) => f.largo < 2048), 'ningún cuerpo grande');
         });
 
         await t.test('C7 la tienda caída: pendiente → la tienda lo trae y lo confirma', async () => {
@@ -342,6 +407,42 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             T.caida = false;
         });
 
+        await t.test('C15 los avisos que trae la tienda: los nuevos primero, sin trabarse', async () => {
+            T.caida = true;
+            try { await c15(); } finally { T.caida = false; }
+        });
+        async function c15() {
+            const mandar = (n) => fetch(`${CENTRAL}/webhooks`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ _id: `aviso-c15-${n}`, topic: 'questions', resource: `/questions/15${n}`, user_id: 777001, application_id: 'APPML' }) });
+            const conError = async (rec) => (await db.query(`SELECT 1 FROM cuevaweb_avisos WHERE recurso = $1 AND error IS NOT NULL`, [rec])).rowCount > 0;
+            for (const n of [1, 2, 3]) {
+                await mandar(n);
+                assert.ok(await hasta(() => conError(`/questions/15${n}`)), `el ${n}, sin poder entregarse`);
+            }
+            const traer = async (limite) => (await pedir('GET', `/cuevaweb/v1/avisos?limite=${limite}`, { clave: CLAVE_A, tienda: CLAVE_A })).datos.avisos.map((a) => a.recurso);
+            assert.deepEqual(await traer(2), ['/questions/151', '/questions/152']);
+            // la tienda no los pudo hacer (no los confirma): no vuelven enseguida; viene el que faltaba
+            assert.deepEqual(await traer(2), ['/questions/153']);
+            // uno que la tienda ya trajo 5 veces sin poder hacerlo (y le toca otra vez) y uno nuevo: el nuevo, primero
+            await db.query(`UPDATE cuevaweb_avisos SET traidas = 5, traido = NOW() - INTERVAL '3 hours' WHERE recurso = '/questions/152'`);
+            await mandar(4);
+            assert.ok(await hasta(() => conError('/questions/154')));
+            assert.deepEqual(await traer(1), ['/questions/154'], 'el nuevo va primero');
+            // traído 12 veces sin poder hacerlo (la última, hace más de 6 horas): se descarta y no vuelve
+            await db.query(`UPDATE cuevaweb_avisos SET traidas = 12, traido = NOW() - INTERVAL '7 hours' WHERE recurso = '/questions/151'`);
+            const cuarta = await traer(10);
+            assert.ok(!cuarta.includes('/questions/151'), 'el descartado ya no viene');
+            assert.ok(cuarta.includes('/questions/152'), 'el que esperaba, sí');
+            const fila = (await db.query(`SELECT descartado, error FROM cuevaweb_avisos WHERE recurso = '/questions/151'`)).rows[0];
+            assert.ok(fila.descartado && /Se descartó/.test(fila.error), JSON.stringify(fila));
+            const e = await pedir('GET', '/cuevaweb/panel/tiendas/tiendaA', { clave: CLAVE_PANEL });
+            assert.equal(e.datos.tienda.avisos.descartados, 1);
+            // la tienda confirma los demás: al día (el descartado no cuenta como pendiente)
+            const ids = (await db.query(`SELECT id FROM cuevaweb_avisos WHERE recurso LIKE '/questions/15_' AND entregado IS NULL AND descartado IS NULL`)).rows.map((r) => String(r.id));
+            assert.equal(ids.length, 3);
+            assert.equal((await pedir('POST', '/cuevaweb/v1/avisos/ack', { clave: CLAVE_A, tienda: CLAVE_A, cuerpo: { ids } })).datos.marcados, 3);
+            assert.equal((await pedir('GET', '/cuevaweb/panel/tiendas/tiendaA', { clave: CLAVE_PANEL })).datos.tienda.avisos.pendientes, 0);
+        }
+
         await t.test('C8 «Conectar con Mercado Pago» y su aviso de pago', async () => {
             const { url, n } = linkConectar(CLAVE_A, 'mp');
             const v = await irYVolver(url, CLAVE_A);
@@ -354,11 +455,32 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             assert.match(r.datos.clave_publica, /^APP_USR-clave-publica-/);
             assert.equal(r.datos.produccion, true);
             assert.ok(r.datos.vence > Date.now() + 100 * 86_400_000);
-            const w = await fetch(`${CENTRAL}/cuevaweb/mp/avisos?t=${idDe(CLAVE_A)}&data.id=8800123&type=payment`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'payment', action: 'payment.created', data: { id: '8800123' }, user_id: 555001 }) });
+            const w = await avisoMp(`t=${idDe(CLAVE_A)}&data.id=8800123&type=payment`, { type: 'payment', action: 'payment.created', data: { id: '8800123' }, user_id: 555001 });
             assert.equal(w.status, 200);
             const llego = await hasta(() => T.recibidos.find((a) => a.origen === 'mp' && a.recurso === '8800123'));
             assert.ok(llego, 'el aviso de pago llegó');
             assert.equal(llego.tema, 'payment');
+        });
+
+        await t.test('C16 los avisos de Mercado Pago: sólo los pagos y sólo con la firma válida', async () => {
+            const q = (id) => `t=${idDe(CLAVE_A)}&data.id=${id}&type=payment`;
+            const cuerpo = (id) => ({ type: 'payment', action: 'payment.created', data: { id: String(id) }, user_id: 555001 });
+            assert.equal((await avisoMp(q(8800201), cuerpo(8800201), { firma: 'ninguna' })).status, 401, 'sin firma');
+            assert.equal((await avisoMp(q(8800202), cuerpo(8800202), { firma: 'mala' })).status, 401, 'con una firma mala');
+            assert.equal((await avisoMp('data.id=8800203&type=payment', cuerpo(8800203), { firma: 'ninguna' })).status, 401, 'sin la t (por el user_id) y sin firma');
+            const otro = await avisoMp(`t=${idDe(CLAVE_A)}&data.id=99&type=merchant_order`, { type: 'merchant_order', data: { id: '99' } });
+            assert.equal(otro.status, 200);
+            assert.equal(otro.datos.ignorado, true, 'lo que no es un pago, se ignora');
+            assert.equal((await avisoMp(q(8800204), JSON.stringify({ ...cuerpo(8800204), relleno: 'x'.repeat(100_000) }), { dataId: 8800204 })).status, 413, 'uno de más de 64 KB ni se lee');
+            // se rechazan ANTES de contestar: nada de eso quedó
+            const n = (await db.query(`SELECT COUNT(*)::int AS n FROM cuevaweb_avisos WHERE recurso IN ('8800201', '8800202', '8800203', '8800204', '99')`)).rows[0].n;
+            assert.equal(n, 0);
+            // la buena pasa, y sólo con lo revisado (una acción rara no viaja)
+            assert.equal((await avisoMp(q(8800205), { ...cuerpo(8800205), action: 'x'.repeat(500) })).status, 200);
+            const llego = await hasta(() => T.recibidos.find((a) => a.origen === 'mp' && a.recurso === '8800205'));
+            assert.ok(llego, 'la buena llegó');
+            assert.equal(llego.cuerpo.action, undefined);
+            assert.equal(llego.cuerpo.user_id, '555001');
         });
 
         await t.test('C9 el panel fuerza la renovación de Mercado Pago', async () => {
@@ -401,6 +523,28 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             assert.ok(e.datos.tienda.mp && e.datos.tienda.mp.conectada);
             assert.equal((await pedir('DELETE', '/cuevaweb/panel/tiendas/tiendaA', { clave: CLAVE_PANEL })).status, 200);
             assert.equal((await pedir('GET', '/cuevaweb/v1/estado', { clave: CLAVE_A, tienda: CLAVE_A })).status, 401);
+        });
+
+        await t.test('C17 las direcciones de prueba que no son de esta máquina se ignoran (y sin MP_WEBHOOK_SECRET no pasa ningún aviso de pago)', async () => {
+            await apagarCentral();
+            central = arrancarCentral({
+                CUEVAWEB_MODO: '1', ML_AUTH_DOMAIN: 'https://auth.ejemplo.invalid', MP_AUTH_DOMAIN: 'http://10.1.2.3:8080',
+                CUEVAWEB_ML_API_URL: 'https://api.ejemplo.invalid', MP_TOKEN_URL: 'http://10.1.2.3/oauth/token', CUEVAWEB_MP_API_URL: 'ftp://127.0.0.1',
+                MP_WEBHOOK_SECRET: undefined,
+            });
+            await hastaQueConteste();
+            for (const [s, deVerdad] of [['ml', 'https://auth.mercadolibre.com.ar/authorization?'], ['mp', 'https://auth.mercadopago.com/authorization?']]) {
+                const r = await fetch(linkConectar(CLAVE_B, s).url, { redirect: 'manual' });
+                assert.equal(r.status, 302);
+                assert.ok(String(r.headers.get('location')).startsWith(deVerdad), `${s}: ${r.headers.get('location')}`);
+            }
+            for (const v of ['ML_AUTH_DOMAIN', 'MP_AUTH_DOMAIN', 'CUEVAWEB_ML_API_URL', 'MP_TOKEN_URL', 'CUEVAWEB_MP_API_URL']) {
+                assert.match(central.log, new RegExp(`${v} no es una dirección de esta máquina`), v);
+            }
+            const sinClave = await avisoMp(`t=${idDe(CLAVE_B)}&data.id=8800301&type=payment`, { type: 'payment', data: { id: '8800301' } });
+            assert.equal(sinClave.status, 401);
+            assert.equal(sinClave.datos.error, 'sin_clave');
+            assert.match(central.log, /falta MP_WEBHOOK_SECRET/);
         });
     } finally {
         await apagarCentral();
