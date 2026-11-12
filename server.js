@@ -60,6 +60,10 @@ import {
     removeFromDenylist,
 } from './license-context.js';
 import { verifyCapabilityToken, normalizeDomain } from './license-token.js';
+// (12/11/2026, v2.11.0) EL MODO CUEVAWEB (conectar.cuevaweb.com.ar): otra instalación de este código para las tiendas de
+// CuevaWeb. Todo en cuevaweb.js y apagado de fábrica: sin CUEVAWEB_MODO=1 Forger anda exactamente igual.
+import { cuevawebActivo, montarCuevaweb, avisoDeMercadoLibre } from './cuevaweb.js';
+const CUEVAWEB_ON = cuevawebActivo();
 
 // Versión del bridge — leído de package.json al arrancar. Se expone en /version
 // para que el cliente pueda verificar qué build está corriendo sin acceso al
@@ -182,8 +186,14 @@ const missing = [];
 if (!ML_CLIENT_ID)     missing.push('ML_CLIENT_ID');
 if (!ML_CLIENT_SECRET) missing.push('ML_CLIENT_SECRET');
 if (!HUB_SECRET)       missing.push('WFML_OAUTH_HUB_SECRET');
-if (missing.length) {
-    console.error('[forger-connect-ml] FATAL: faltan env vars:', missing.join(', '));
+// (12/11/2026) En el modo CuevaWeb, Mercado Libre es opcional: conectar.cuevaweb.com.ar puede arrancar sólo con Mercado
+// Pago (el botón de Mercado Libre dice «todavía no está disponible»). Sin el modo, igual que siempre.
+const faltanDeVerdad = CUEVAWEB_ON ? missing.filter((k) => !k.startsWith('ML_')) : missing;
+if (CUEVAWEB_ON && faltanDeVerdad.length < missing.length) {
+    console.warn('[forger-connect-ml] modo CuevaWeb sin la app de Mercado Libre (ML_CLIENT_ID/ML_CLIENT_SECRET): sólo Mercado Pago.');
+}
+if (faltanDeVerdad.length) {
+    console.error('[forger-connect-ml] FATAL: faltan env vars:', faltanDeVerdad.join(', '));
     process.exit(1);
 }
 
@@ -473,9 +483,12 @@ async function checkAndConsumeNonce(nonce, purpose) {
 }
 
 /** Render simple HTML para páginas de error / fallback. */
+// (12/11/2026) en conectar.cuevaweb.com.ar (modo CuevaWeb) las páginas no dicen «Forger»
+const MARCA_PAGINAS = CUEVAWEB_ON ? 'CuevaWeb' : 'Forger';
+const PIE_PAGINAS = CUEVAWEB_ON ? 'conectar.cuevaweb.com.ar' : 'forger-connect-ml · stateless OAuth bridge';
 function htmlPage(title, body) {
     return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
-<title>${title} · Forger</title>
+<title>${title} · ${MARCA_PAGINAS}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f8fafc; color: #1f2937; padding: 40px 20px; line-height: 1.55; }
@@ -488,7 +501,7 @@ function htmlPage(title, body) {
 </style>
 </head><body>
 <div class="wrap">${body}</div>
-<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:30px;">forger-connect-ml · stateless OAuth bridge</p>
+<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:30px;">${PIE_PAGINAS}</p>
 </body></html>`;
 }
 
@@ -679,6 +692,12 @@ mountV1(app, {
         isLicenseActive,
     },
 });
+
+// ============================================================================
+// (12/11/2026) EL MODO CUEVAWEB (conectar.cuevaweb.com.ar): las rutas /cuevaweb/* y sus vueltas solas (cuevaweb.js).
+// Antes de la portada de Forger (acá la reemplaza la de CuevaWeb). Sin CUEVAWEB_MODO=1 no se monta nada.
+// ============================================================================
+if (CUEVAWEB_ON) montarCuevaweb(app);
 
 // ============================================================================
 // GET /healthz — liveness check para el reverse proxy.
@@ -1942,6 +1961,12 @@ app.post(['/connect-ml/webhooks', '/webhooks'], limitWebhooks, (req, res) => {
     }
     if (wId) {
         webhookSeen.set(wId, Date.now() + WEBHOOK_SEEN_TTL_MS);
+    }
+
+    // (12/11/2026) Modo CuevaWeb: si el vendedor es de una tienda de CuevaWeb, el aviso (cualquier tópico) se le reenvía
+    // a esa tienda (cuevaweb.js). Apagado de fábrica: sin CUEVAWEB_MODO=1 no se llama. Lo de Forger sigue abajo igual.
+    if (CUEVAWEB_ON) {
+        avisoDeMercadoLibre(body).catch((e) => console.error('[cuevaweb] aviso de Mercado Libre:', e.message));
     }
 
     const isItem     = WEBHOOK_ITEM_TOPICS.has(topic);
