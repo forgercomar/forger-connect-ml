@@ -513,8 +513,10 @@ async function entregar(tiendaId) {
 
 /** Los tópicos que la tienda hace (src/lib/mercadolibre/avisos.ts): los demás no se le mandan. */
 const TEMAS_ML = new Set(['orders_v2', 'orders', 'questions', 'messages', 'items', 'shipments', 'claims']);
-/** Un recurso de Mercado Libre: «/orders/123», «/items/MLA123/prices», «/messages/abc», «/post-purchase/v1/claims/9»… */
-const RECURSO_ML = /^\/[A-Za-z0-9_\-./?=&%:]{1,199}$/;
+/** Un recurso de Mercado Libre: «/orders/123», «/items/MLA123/prices», «/post-purchase/v1/claims/9»… (12/11/2026) y los de
+ *  «messages», que llegan con el id SOLO, sin barra («bd5f7ef4…», como dice la documentación de Mercado Libre; la tienda
+ *  los lee igual: src/lib/mercadolibre/avisos.ts → idDe). Con la barra obligatoria se descartaban TODOS los de mensajes. */
+const RECURSO_ML = /^\/?[A-Za-z0-9_\-./?=&%:]{1,199}$/;
 const entero = (v) => (Number.isInteger(v) && v >= 0 && v <= 1_000_000 ? v : undefined);
 const fecha = (v) => (typeof v === 'string' && v.length <= 40 && !Number.isNaN(Date.parse(v)) ? v : undefined);
 

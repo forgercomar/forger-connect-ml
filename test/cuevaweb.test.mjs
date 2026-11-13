@@ -30,7 +30,8 @@
  *   C13 el token forzado con `actual`: si el que falló no es el de acá (la tienda tenía uno viejo), no se gasta otra
  *       renovación; si es el de acá, se renueva
  *   C14 los avisos de Mercado Libre, revisados y con tope: un recurso gigante, un tópico raro o un usuario que no es un
- *       número no se guardan; del cuerpo sólo viaja lo esperado (el App ID como texto)
+ *       número no se guardan; del cuerpo sólo viaja lo esperado (el App ID como texto); (12/11/2026) el de «messages» con
+ *       el id solo, sin barra (como lo manda Mercado Libre), llega
  *   C15 los avisos que trae la tienda: los nuevos primero; uno traído y no confirmado espera antes de volver; pasadas 12
  *       veces se descarta (el panel lo cuenta) y no tapa a los demás
  *   C16 los avisos de Mercado Pago: sin firma, con una mala o sin MP_WEBHOOK_SECRET → 401 y no se guarda nada; otro tipo
@@ -389,6 +390,11 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             const filas = (await db.query(`SELECT recurso, length(cuerpo::text) AS largo FROM cuevaweb_avisos`)).rows;
             assert.ok(!filas.some((f) => /^\/orders\/3[123]$/.test(f.recurso) || f.recurso.length > 200), JSON.stringify(filas.map((f) => f.recurso.slice(0, 40))));
             assert.ok(filas.every((f) => f.largo < 2048), 'ningún cuerpo grande');
+            // (12/11/2026) «messages» llega con el id solo, sin barra (como lo manda Mercado Libre): tiene que llegar
+            await mandar({ _id: 'aviso-msj-1', topic: 'messages', resource: 'bd5f7ef4a5a14d2cb8c6c6a4ec8c3e6c', user_id: 777001, application_id: 'APPML' });
+            const mensaje = await hasta(() => T.recibidos.find((a) => a.recurso === 'bd5f7ef4a5a14d2cb8c6c6a4ec8c3e6c'));
+            assert.ok(mensaje, 'el aviso de un mensaje (sin barra) llegó a la tienda');
+            assert.equal(mensaje.tema, 'messages');
         });
 
         await t.test('C7 la tienda caída: pendiente → la tienda lo trae y lo confirma', async () => {
