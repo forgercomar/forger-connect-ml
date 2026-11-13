@@ -24,10 +24,16 @@
  * El navegador del dueño va y vuelve con paquetes firmados con la clave de su tienda (?d=…&f=…, como «Continuar con
  * Google» del panel), y la conexión queda PENDIENTE hasta que la tienda la confirma con el nonce de la cookie de ESE
  * navegador: nadie puede conectar su cuenta a una tienda ajena mandándole un link.
+ * (13/11/2026, la confirmación) Y antes de volver a la tienda, el dueño VE qué cuenta entró: la vuelta del OAuth muestra
+ * «Confirmá tu cuenta de …» (la misma pantalla que Forger, con la marca de CuevaWeb) y la tienda recibe la conexión
+ * recién cuando toca «Confirmar y conectar». Ninguna cuenta se conecta sin esa confirmación.
  *
  * Rutas (todas bajo /cuevaweb):
  *   GET  /cuevaweb/conectar?t=&d=&f=        el botón de la tienda: al OAuth de Mercado Libre o de Mercado Pago
- *   GET  /cuevaweb/ml/volver, /mp/volver    la vuelta del OAuth (las «Redirect URI» de las dos apps)
+ *   GET  /cuevaweb/ml/volver, /mp/volver    la vuelta del OAuth (las «Redirect URI» de las dos apps): (13/11/2026) deja la
+ *                                           conexión pendiente y muestra la pantalla de confirmación (no vuelve a la tienda)
+ *   POST /cuevaweb/ml/decidir, /mp/decidir  (13/11/2026) el formulario de esa pantalla: «Confirmar y conectar» → a la tienda,
+ *                                           que la confirma como siempre; «Cancelar (usar otra cuenta)» → se borra la pendiente
  *   POST /cuevaweb/mp/avisos[?t=]           las notificaciones de Mercado Pago (las de Mercado Libre llegan a /webhooks)
  *   tienda: POST v1/confirmar · GET v1/estado · GET v1/ml/token · GET v1/mp/token (?forzar=1&actual=<huella del suyo>)
  *           POST v1/desconectar · GET v1/avisos · POST v1/avisos/ack
@@ -46,6 +52,7 @@
  * si son de esta máquina: localhost o 127.0.0.1), CUEVAWEB_AVISOS_CADA_MS y CUEVAWEB_RENOVAR_CADA_MS.
  */
 
+import { LOGOS_CW } from './cuevaweb-logos.js';
 import crypto from 'node:crypto';
 import { query, tx } from './db.js';
 import { encryptToken, decryptToken, sealSecret, openSecret } from './auth.js';
@@ -260,7 +267,8 @@ function urlDeAutorizacion(servicio, estado) {
     return u.toString();
 }
 
-/** El código de la vuelta → los tokens y quién es la cuenta. */
+/** El código de la vuelta → los tokens y quién es la cuenta. (13/11/2026, la confirmación) También el correo que da
+ *  /users/me (si viene): sólo para mostrárselo al dueño en la pantalla de confirmación; no se guarda ni va al registro. */
 async function canjear(servicio, code) {
     const c = conf();
     if (servicio === 'ml') {
@@ -279,6 +287,7 @@ async function canjear(servicio, code) {
         if (!usuario) throw new Problema('No pudimos saber qué cuenta de Mercado Libre se conectó. Probá de nuevo.');
         return {
             usuario, nombre: String(u.nickname || ''), sitio: String(u.site_id || 'MLA'), clavePublica: '', produccion: true,
+            correo: typeof u.email === 'string' ? u.email : '',
             access: String(t.datos.access_token), refresh: String(t.datos.refresh_token),
             vence: new Date(Date.now() + (Number(t.datos.expires_in) || 21600) * 1000),
         };
@@ -297,6 +306,7 @@ async function canjear(servicio, code) {
     const nombre = String(u.nickname || [u.first_name, u.last_name].filter(Boolean).join(' ') || u.email || '').trim();
     return {
         usuario, nombre, sitio: String(u.site_id || ''), clavePublica: String(t.datos.public_key || ''), produccion: t.datos.live_mode !== false,
+        correo: typeof u.email === 'string' ? u.email : '',
         access: String(t.datos.access_token), refresh: String(t.datos.refresh_token),
         vence: new Date(Date.now() + (Number(t.datos.expires_in) || 15_552_000) * 1000),
     };
@@ -621,7 +631,7 @@ async function limpiar() {
 
 // ─────────────────────────────────────────────────────────────── las páginas (sólo si no se puede volver a la tienda)
 
-const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 function paginaCw(titulo, texto) {
     return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>${esc(titulo)} · CuevaWeb</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
@@ -633,6 +643,237 @@ function paginaCw(titulo, texto) {
   p { color: #52525b; margin: 6px 0; }
   @media (prefers-color-scheme: dark) { body { background: #0b0d12; color: #f4f4f5; } .caja { background: #15171d; border-color: #27272a; } p { color: #a1a1aa; } .marca { color: #b9a3ff; } }
 </style></head><body><div class="caja"><p class="marca">CuevaWeb</p><h1>${esc(titulo)}</h1><p>${esc(texto)}</p></div></body></html>`;
+}
+
+// ─────────────────────────────────────────────────────────────── la confirmación (13/11/2026)
+//
+// (13/11/2026, la confirmación) El autor: «NO SE PUEDE CONECTAR NINGUNA CUENTA SIN PREVIA CONFIRMACIÓN, ESTO ES UN ERROR DE
+// PRODUCTO». Antes, la vuelta del OAuth guardaba la conexión pendiente y mandaba al dueño derecho a su tienda, que la
+// confirmaba: si el navegador tenía abierta OTRA cuenta de Mercado Libre o de Mercado Pago, se conectaba ésa sin que nadie
+// la viera. Ahora la vuelta muestra la MISMA pantalla que Forger (confirmationPage de server.js: el trío del encabezado con
+// su animación, los datos de la cuenta, el recuadro amarillo y los dos botones) con la marca de CuevaWeb, y la tienda
+// recibe la conexión recién cuando el dueño toca «Confirmar y conectar». Como /connect-ml/finish de Forger, el formulario
+// no guarda estado: va firmado con una clave de acá, vence a los 15 minutos y sirve UNA vez.
+
+const VENCE_DECIDIR_S = 15 * 60;
+/** (13/11/2026, la revisión) La marca de una pendiente que el dueño todavía no confirmó (va adelante del nonce). */
+const MARCA_SIN_DECIDIR = '?';
+
+/** La clave del formulario: derivada de WFML_OAUTH_HUB_SECRET (sin ella el server ni arranca) con una etiqueta propia,
+ *  así no sirve para ninguna otra firma. */
+function claveDecidir() {
+    const base = String(process.env.WFML_OAUTH_HUB_SECRET || '');
+    if (!base) throw new Error('falta WFML_OAUTH_HUB_SECRET');
+    return crypto.createHmac('sha256', base).update('cuevaweb-decidir.v1').digest();
+}
+/** La firma del formulario: la tienda, el servicio, el nonce del navegador, la vuelta, la cuenta que se mostró (u), ts y
+ *  jti, como una lista JSON (ningún campo se puede «correr» al de al lado). (13/11/2026, la revisión) Con `u`, el
+ *  formulario sólo sirve para la cuenta que el dueño vio. */
+const firmaDecidir = (c) => hmac(claveDecidir(), JSON.stringify(['cw-decidir', c.t, c.s, c.n, c.v, c.u, c.ts, c.jti]));
+function formularioDecidir(tiendaId, servicio, nonce, vuelta, usuario) {
+    const c = {
+        t: String(tiendaId), s: servicio, n: String(nonce), v: String(vuelta), u: String(usuario),
+        ts: String(Math.floor(Date.now() / 1000)), jti: crypto.randomBytes(16).toString('hex'),
+    };
+    return { ...c, f: firmaDecidir(c) };
+}
+
+/** Los encabezados de la pantalla: que no quede en ningún caché, que no diga de dónde viene y que NO se pueda meter en un
+ *  iframe (el botón «Confirmar y conectar» no puede quedar expuesto a que otra página lo haga tocar por debajo). */
+const ENCABEZADOS_CONFIRMAR = {
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+    'X-Frame-Options': 'DENY',
+    'Content-Security-Policy': "frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+    'X-Content-Type-Options': 'nosniff',
+};
+
+// (13/11/2026, la revisión) los logos van ADENTRO de conectar (cuevaweb-logos.js): los de afuera se rompían
+const LOGOS = LOGOS_CW;
+/** «Tu tienda»: un local con su toldo, dibujado acá (sin imagen de afuera). */
+const ICONO_TIENDA = '<svg viewBox="0 0 32 32" width="34" height="34" aria-hidden="true" focusable="false">'
+    + '<rect x="6" y="13" width="20" height="14" rx="1.5" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2"/>'
+    + '<rect x="13.5" y="18.5" width="5" height="8.5" rx="1" fill="#8b5cf6"/>'
+    + '<rect x="8.5" y="17" width="3" height="3.5" rx=".6" fill="#ddd6fe"/><rect x="20.5" y="17" width="3" height="3.5" rx=".6" fill="#ddd6fe"/>'
+    + '<path d="M7 5h18l3 7H4z" fill="#8b5cf6" stroke="#8b5cf6" stroke-width="2" stroke-linejoin="round"/>'
+    + '<path d="M11.5 5 10 12M16 5v7M20.5 5l1.5 7" stroke="#ede9fe" stroke-width="1.4"/>'
+    + '<path d="M4 12a3 3 0 0 0 6 0a3 3 0 0 0 6 0a3 3 0 0 0 6 0a3 3 0 0 0 6 0z" fill="#8b5cf6"/>'
+    + '</svg>';
+
+const PAISES = {
+    MLA: 'Argentina', MLB: 'Brasil', MLM: 'México', MLC: 'Chile', MCO: 'Colombia', MLU: 'Uruguay', MPE: 'Perú',
+    MLV: 'Venezuela', MEC: 'Ecuador', MBO: 'Bolivia', MPY: 'Paraguay', MCR: 'Costa Rica', MPA: 'Panamá',
+    MRD: 'República Dominicana', MGT: 'Guatemala', MHN: 'Honduras', MNI: 'Nicaragua', MSV: 'El Salvador', MCU: 'Cuba',
+};
+function paisDe(sitio) {
+    const k = String(sitio || '').trim().toUpperCase();
+    if (!k) return '—';
+    return PAISES[k] ? `${PAISES[k]} (${k})` : k;
+}
+function dominioDe(url) {
+    try {
+        return new URL(String(url)).host;
+    } catch (_) {
+        return String(url || '');
+    }
+}
+
+/**
+ * La pantalla «Confirmá tu cuenta de …»: confirmationPage() de server.js (Forger) con la marca de CuevaWeb. `cuenta` es lo
+ * que devolvió canjear() (nunca se muestran los tokens), `activa` la conexión que la tienda ya tiene con ese servicio (o
+ * null) y `form` lo de formularioDecidir(). Todo lo que viene de afuera (el apodo, el nombre, el correo, el nombre y el
+ * dominio de la tienda) va escapado.
+ */
+function paginaConfirmar({ servicio, tienda, cuenta, activa, form }) {
+    const ml = servicio === 'ml';
+    const avisos = [];
+    if (activa && String(activa.usuario_id) === String(cuenta.usuario)) {
+        avisos.push('Esta cuenta ya está conectada a esta tienda: confirmar sólo renueva el permiso (no duplica nada).');
+    } else if (activa) {
+        // (13/11/2026, la revisión) en Mercado Libre la tienda NO cambia la cuenta si ya trajo publicaciones o ventas de la
+        // otra (motivoParaNoConectar: no se mezclan): el aviso lo dice, para no prometer algo que después no pasa
+        avisos.push(`Hoy esta tienda está conectada con <strong>${esc(activa.nombre || activa.usuario_id)}</strong>. ${ml ? 'Si confirmás, se cambia por esta, salvo que la tienda ya haya traído publicaciones o ventas de esa cuenta: en ese caso no se cambia nada y primero hay que desconectarla.' : 'Si confirmás, se cambia por esta. Los cobros nuevos van a caer en esta cuenta.'}`);
+    }
+    if (!ml && !cuenta.produccion) avisos.push('Es una cuenta de prueba: no cobra de verdad.');
+    const avisosHtml = avisos.length === 0 ? '' : `
+        <div class="warnings">
+            <strong>⚠ Atención antes de confirmar:</strong>
+            <ul>${avisos.map((a) => `<li>${a}</li>`).join('')}</ul>
+        </div>
+`;
+    const fila = (k, v, grande = false) => `<div class="row"><span class="k">${k}</span><span class="v${grande ? ' big' : ''}">${v}</span></div>`;
+    const correo = cuenta.correo ? esc(cuenta.correo) : '—';
+    const numero = `<code>${esc(cuenta.usuario)}</code>`;
+    const filas = ml
+        ? [fila('Usuario', esc(cuenta.nombre || '—'), true), fila('Correo', correo), fila('País', esc(paisDe(cuenta.sitio))), fila('Número de usuario', numero)]
+        : [
+            fila('Cuenta', esc(cuenta.nombre || '—'), true), fila('Correo', correo), fila('Número de usuario', numero),
+            fila('Modo', cuenta.produccion ? '<span class="pill-mode pill-live">Producción · cobros reales</span>' : '<span class="pill-mode pill-test">Prueba · sin cobros reales</span>'),
+        ];
+    const dominio = dominioDe(tienda.url);
+    const campo = (k) => `<input type="hidden" name="${k}" value="${esc(form[k])}" />`;
+
+    return `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<title>Confirmá tu cuenta de ${NOMBRE[servicio]} · CuevaWeb</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(180deg,#f5f7fa 0%,#eef2f7 100%); color: #1f2937; padding: 20px; line-height: 1.55; min-height: 100vh; margin: 0; }
+  .wrap { max-width: 680px; margin: 40px auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.06); overflow: hidden; }
+  /* === el trío === */
+  .hero { background: radial-gradient(circle at 25% 50%, rgba(139,92,246,0.07), transparent 45%), radial-gradient(circle at 75% 50%, ${ml ? 'rgba(255,230,0,0.10)' : 'rgba(0,158,227,0.08)'}, transparent 45%), linear-gradient(180deg,#fafbfc 0%,#f3f4f6 100%); padding: 32px 24px 28px; border-bottom: 1px solid #e5e7eb; }
+  .trio { display: grid; grid-template-columns: minmax(0,1fr) 80px minmax(0,1.3fr) 80px minmax(0,1fr); align-items: center; justify-items: center; gap: 0; max-width: 560px; margin: 0 auto; }
+  .side, .center { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; position: relative; min-width: 0; max-width: 100%; }
+  .ring { background: #fff; border-radius: 50%; width: 56px; height: 56px; display: inline-flex; align-items: center; justify-content: center; box-shadow: 0 4px 14px rgba(0,0,0,0.08), 0 1px 3px rgba(0,0,0,0.04); border: 1px solid rgba(0,0,0,0.04); position: relative; z-index: 1; flex-shrink: 0; }
+  .ring img, .ring svg { max-width: 36px; max-height: 36px; object-fit: contain; }
+  .ring.is-center { width: 76px; height: 76px; box-shadow: 0 8px 24px rgba(139,92,246,0.18), 0 2px 6px rgba(0,0,0,0.08); }
+  .ring.is-center img { max-width: 52px; max-height: 52px; }
+  .halo { position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 76px; height: 76px; border-radius: 50%; background: radial-gradient(circle, rgba(139,92,246,0.25) 0%, transparent 70%); animation: pulse 2.6s ease-in-out infinite; pointer-events: none; z-index: 0; }
+  @keyframes pulse { 0%,100% { transform: translateX(-50%) scale(1); opacity: 0.7; } 50% { transform: translateX(-50%) scale(1.15); opacity: 0.3; } }
+  .label { font-size: 11px; color: #4b5563; line-height: 1.3; font-weight: 500; max-width: 100%; overflow-wrap: anywhere; }
+  .label .tienda { color: #111827; font-weight: 700; }
+  .label.is-center { font-size: 12px; }
+  .label.is-center strong { color: #8b5cf6; font-weight: 700; font-size: 13px; }
+  .label.is-center span { color: #6b7280; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .connector { position: relative; width: 100%; height: 18px; display: flex; align-items: center; }
+  .line { width: 100%; height: 2px; background: linear-gradient(90deg,transparent 0%,#cbd5e1 15%,#cbd5e1 85%,transparent 100%); border-radius: 999px; }
+  .dot { position: absolute; top: 50%; left: 0; width: 6px; height: 6px; border-radius: 50%; background: #8b5cf6; transform: translateY(-50%); box-shadow: 0 0 8px rgba(139,92,246,0.6); animation: flow 2.4s linear infinite; }
+  .dot.d2 { animation-delay: 0.8s; } .dot.d3 { animation-delay: 1.6s; }
+  @keyframes flow { 0% { left: -6px; opacity: 0; transform: translateY(-50%) scale(0.5); } 10% { opacity: 1; transform: translateY(-50%) scale(1); } 90% { opacity: 1; transform: translateY(-50%) scale(1); } 100% { left: calc(100% + 6px); opacity: 0; transform: translateY(-50%) scale(0.5); } }
+  /* === el cuerpo === */
+  .body { padding: 26px 32px 28px; }
+  h1 { margin: 0 0 6px; font-size: 20px; color: #111827; }
+  .intro { color: #4b5563; font-size: 13.5px; margin: 0 0 18px; }
+  .site-pill { display: inline-block; background: #f5f3ff; color: #5b21b6; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; margin-left: 4px; max-width: 100%; overflow-wrap: anywhere; }
+  .details { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px; padding: 4px 0; margin-bottom: 16px; }
+  .row { display: flex; padding: 10px 16px; border-bottom: 1px solid #f3f4f6; }
+  .row:last-child { border-bottom: 0; }
+  .row .k { width: 150px; color: #6b7280; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; flex-shrink: 0; }
+  .row .v { flex: 1; min-width: 0; font-size: 13px; color: #111827; overflow-wrap: anywhere; }
+  .row .v code { background: #f3f4f6; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+  .row .v.big { font-weight: 700; font-size: 15px; }
+  .pill-mode { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+  .pill-live { background: #dcfce7; color: #166534; } .pill-test { background: #fef3c7; color: #92400e; }
+  .warnings { background: #fef3c7; border: 1px solid #fde68a; border-radius: 10px; padding: 12px 16px; margin-bottom: 18px; color: #78350f; font-size: 12.5px; }
+  .warnings > strong { display: block; margin-bottom: 6px; }
+  .warnings ul { margin: 0; padding-left: 18px; }
+  .warnings li { margin: 4px 0; line-height: 1.45; overflow-wrap: anywhere; }
+  .actions { display: flex; gap: 12px; justify-content: flex-end; }
+  .btn { padding: 10px 18px; border-radius: 8px; border: 1px solid; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; }
+  .btn-primary { background: #8b5cf6; border-color: #8b5cf6; color: #fff; }
+  .btn-primary:hover { background: #7c3aed; border-color: #7c3aed; }
+  .btn-secondary { background: #fff; border-color: #d1d5db; color: #374151; }
+  .btn-secondary:hover { background: #f9fafb; border-color: #9ca3af; }
+  .btn:focus-visible { outline: 2px solid #8b5cf6; outline-offset: 2px; }
+  /* (13/11/2026, la revisión) enviado: los dos botones quedan quietos (con la red lenta, un segundo clic cortaba el primero) */
+  .enviando .btn { opacity: 0.6; pointer-events: none; cursor: progress; }
+  .hint { margin: 18px 0 0; font-size: 11.5px; color: #9ca3af; text-align: center; line-height: 1.5; }
+  @media (max-width: 560px) {
+      .trio { grid-template-columns: minmax(0,1fr) 30px minmax(0,1.3fr) 30px minmax(0,1fr); }
+      .row { flex-direction: column; gap: 4px; }
+      .row .k { width: auto; }
+      .actions { flex-direction: column-reverse; }
+      .btn { width: 100%; }
+  }
+  /* (13/11/2026) en un celular de 360 px y en la ventana aparte (620 × 760): menos margen, así entra todo */
+  @media (max-width: 420px) {
+      body { padding: 12px; }
+      .wrap { margin: 8px auto; }
+      .hero { padding: 24px 10px 20px; }
+      .trio { grid-template-columns: minmax(0,1fr) 22px minmax(0,1.2fr) 22px minmax(0,1fr); }
+      .body { padding: 22px 18px 24px; }
+  }
+  @media (max-height: 820px) { .wrap { margin-top: 12px; margin-bottom: 12px; } }
+  /* (13/11/2026, la revisión) en una notebook de 768 px de alto la ventana deja unos 660: menos relleno, y los botones a la vista */
+  @media (max-height: 700px) { body { padding: 10px; } .wrap { margin: 6px auto; } .hero { padding: 18px 16px 14px; } .body { padding: 18px 24px 20px; } .intro { margin-bottom: 12px; } .details { margin-bottom: 12px; } .row { padding: 7px 16px; } }
+</style>
+</head><body>
+<div class="wrap">
+    <div class="hero">
+        <div class="trio">
+            <div class="side">
+                <div class="ring">${ICONO_TIENDA}</div>
+                <span class="label">Tu tienda<br><span class="tienda">${esc(tienda.nombre || dominio)}</span></span>
+            </div>
+            <div class="connector" aria-hidden="true">
+                <span class="line"></span><span class="dot"></span><span class="dot d2"></span><span class="dot d3"></span>
+            </div>
+            <div class="center">
+                <div class="halo" aria-hidden="true"></div>
+                <div class="ring is-center"><img src="${LOGOS.cuevaweb}" alt="CuevaWeb" onerror="this.style.display='none'" /></div>
+                <span class="label is-center"><strong>CuevaWeb</strong><br><span>Capa de integración</span></span>
+            </div>
+            <div class="connector" aria-hidden="true">
+                <span class="line"></span><span class="dot"></span><span class="dot d2"></span><span class="dot d3"></span>
+            </div>
+            <div class="side">
+                <div class="ring"><img src="${ml ? LOGOS.ml : LOGOS.mp}" alt="${NOMBRE[servicio]}" onerror="this.style.display='none'" /></div>
+                <span class="label">${ml ? 'Publicaciones en Mercado Libre' : 'Cobros con Mercado Pago'}</span>
+            </div>
+        </div>
+    </div>
+    <div class="body">
+        <h1>Confirmá tu cuenta de ${NOMBRE[servicio]}</h1>
+        <p class="intro">Esta es la cuenta que se va a conectar a tu tienda
+            <span class="site-pill">${esc(dominio)}</span>.
+            <strong>Antes de confirmar</strong>, revisá que sea la cuenta correcta: la sesión abierta en este navegador puede no ser la que querés conectar.</p>
+
+        <div class="details">
+            ${filas.join('\n            ')}
+        </div>
+${avisosHtml}
+        <form method="POST" action="/cuevaweb/${servicio}/decidir" class="actions" onsubmit="if (this.dataset.enviado) return false; this.dataset.enviado = '1'; this.classList.add('enviando');">
+            ${['t', 'n', 'v', 'u', 'ts', 'jti', 'f'].map(campo).join('\n            ')}
+            <button type="submit" name="decision" value="cancel" class="btn btn-secondary">Cancelar (usar otra cuenta)</button>
+            <button type="submit" name="decision" value="confirm" class="btn btn-primary">Confirmar y conectar</button>
+        </form>
+
+        <p class="hint">Si no es la cuenta correcta: cancelá, cerrá la sesión en ${ml ? 'mercadolibre.com.ar' : 'mercadopago.com.ar'} y volvé a conectar desde el panel de tu tienda.</p>
+    </div>
+</div>
+<p style="text-align:center;font-size:11px;color:#9ca3af;margin-top:24px;">conectar.cuevaweb.com.ar</p>
+</body></html>`;
 }
 
 // ─────────────────────────────────────────────────────────────── las rutas
@@ -713,7 +954,8 @@ async function estadoDeTienda(t) {
  * la API v1 (antes de la portada de Forger, que acá se reemplaza por la de CuevaWeb).
  */
 export function montarCuevaweb(app) {
-    const limiteConectar = createRateLimiter({ bucket: 'cw-conectar', windowMs: 15 * 60_000, max: 40, label: '/cuevaweb/conectar + volver' });
+    // (13/11/2026) el mismo límite para la decisión de la pantalla de confirmación (/decidir)
+    const limiteConectar = createRateLimiter({ bucket: 'cw-conectar', windowMs: 15 * 60_000, max: 40, label: '/cuevaweb/conectar + volver + decidir' });
     const limiteTienda = createRateLimiter({ bucket: 'cw-tienda', windowMs: 60_000, max: 300, label: '/cuevaweb/v1/*' });
     const limitePanel = createRateLimiter({ bucket: 'cw-panel', windowMs: 60_000, max: 300, label: '/cuevaweb/panel/*' });
     const limiteAvisosMp = createRateLimiter({ bucket: 'cw-avisos-mp', windowMs: 60_000, max: 600, label: '/cuevaweb/mp/avisos' });
@@ -798,14 +1040,81 @@ export function montarCuevaweb(app) {
                         (tienda_id, servicio, estado, usuario_id, nombre, sitio, clave_publica, produccion,
                          access_enc, access_iv, refresh_enc, refresh_iv, vence, nonce)
                      VALUES ($1, $2, 'pendiente', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-                    [t.id, servicio, x.usuario, x.nombre, x.sitio, x.clavePublica, x.produccion, a.enc, a.iv, r.enc, r.iv, x.vence.toISOString(), fila.nonce]
+                    // (13/11/2026, la revisión) el nonce, MARCADO con «?» hasta que el dueño toque «Confirmar y conectar»:
+                    // /v1/confirmar busca el nonce tal cual, así que ninguna tienda (ni una versión vieja o con un error)
+                    // puede activar una pendiente que nadie confirmó
+                    [t.id, servicio, x.usuario, x.nombre, x.sitio, x.clavePublica, x.produccion, a.enc, a.iv, r.enc, r.iv, x.vence.toISOString(), MARCA_SIN_DECIDIR + fila.nonce]
                 );
             });
-            // `usuario`: la tienda revisa ANTES de confirmar si tiene guardado lo de otra cuenta (no se mezcla)
-            return volver({ ok: true, cuenta: x.nombre || x.usuario, usuario: x.usuario });
+            // (13/11/2026, la confirmación) Ya NO vuelve a la tienda: el dueño ve qué cuenta entró y decide (/decidir). La
+            // tienda recibe { ok: true, cuenta, usuario } recién cuando toca «Confirmar y conectar».
+            const activa = await conexionActiva(t.id, servicio);
+            const html = paginaConfirmar({ servicio, tienda: t, cuenta: x, activa, form: formularioDecidir(t.id, servicio, fila.nonce, fila.vuelta, x.usuario) });
+            return res.status(200).set(ENCABEZADOS_CONFIRMAR).type('html').send(html);
         } catch (e) {
             if (!(e instanceof Problema)) console.error(`[cuevaweb] volver de ${servicio}:`, e.message);
             return volver({ ok: false, error: e instanceof Problema ? e.message : `No pudimos terminar la conexión con ${NOMBRE[servicio]}. Probá de nuevo en un rato.` });
+        }
+    });
+
+    // ── la decisión del dueño en la pantalla de confirmación ─────────────────────────────────────────────────────
+    // (13/11/2026, la confirmación) Como /connect-ml/finish de Forger, sin estado en el formulario más que lo firmado:
+    //   decision=confirm  la conexión pendiente de esa tienda, servicio y nonce tiene que seguir ahí → a la tienda con
+    //                     { ok: true, cuenta, usuario } (lo que mandaba /volver antes: la tienda revisa y confirma como hoy)
+    //   decision=cancel   se borra esa pendiente → a la tienda con { ok: false, error: 'Cancelaste: no se conectó ninguna cuenta.' }
+    // Vencido (15 minutos), repetido (el jti sirve una vez, también para «Cancelar»), adulterado, sin la pendiente o desde
+    // otro sitio (Sec-Fetch-Site): 400 con la página de CuevaWeb, sin tocar nada.
+    app.post('/cuevaweb/:servicio(ml|mp)/decidir', limiteConectar, async (req, res) => {
+        const servicio = req.params.servicio;
+        const b = req.body && typeof req.body === 'object' ? req.body : {};
+        const campo = (k, max) => (typeof b[k] === 'string' && b[k].length <= max ? b[k] : '');
+        const noVale = () => res.status(400).set(ENCABEZADOS_CONFIRMAR).type('html').send(paginaCw('La confirmación venció o ya se usó', 'Volvé al panel de tu tienda y tocá el botón otra vez.'));
+        try {
+            // el formulario sale de la pantalla de acá: otro sitio no lo puede mandar (un navegador sin Sec-Fetch-Site pasa:
+            // la firma igual alcanza)
+            const sitio = String(req.get('sec-fetch-site') || '');
+            if (sitio && sitio !== 'same-origin') return noVale();
+            const c = { t: campo('t', 20), s: servicio, n: campo('n', 200), v: campo('v', 300), u: campo('u', 40), ts: campo('ts', 12), jti: campo('jti', 32) };
+            const f = campo('f', 64);
+            const decision = campo('decision', 10);
+            if (decision !== 'confirm' && decision !== 'cancel') return noVale();
+            if (!/^\d{1,18}$/.test(c.t) || c.n.length < 16 || !c.v || !c.u || !/^\d{9,12}$/.test(c.ts) || !/^[a-f0-9]{32}$/.test(c.jti) || !f) return noVale();
+            if (!iguales(f, firmaDecidir(c))) return noVale();
+            const edad = Math.floor(Date.now() / 1000) - Number(c.ts);
+            if (edad > VENCE_DECIDIR_S || edad < -60) return noVale();
+            const t = await tiendaPorId(c.t);
+            const clave = t && !t.baja && openSecret(t.clave);
+            if (!t || !clave) return noVale();
+            const p = (await query(`SELECT * FROM cuevaweb_conexiones WHERE tienda_id = $1 AND servicio = $2 AND estado = 'pendiente'`, [t.id, servicio])).rows[0];
+            // la pendiente de ESTE navegador y de la MISMA cuenta que se mostró: sin decidir (con la marca) o ya confirmada
+            // por el dueño y todavía sin activar (otra pantalla de la misma vuelta: la tienda igual confirma una sola vez)
+            const sinDecidir = !!p && !!p.nonce && iguales(p.nonce, MARCA_SIN_DECIDIR + c.n);
+            const decididaAntes = !!p && !!p.nonce && iguales(p.nonce, c.n);
+            if (!p || (!sinDecidir && !decididaAntes) || String(p.usuario_id) !== c.u) return noVale();
+            // de un solo uso (también «Cancelar», que borra): el segundo envío del mismo formulario no hace nada
+            const nuevo = await query(
+                `INSERT INTO request_nonces (nonce, purpose, created_at) VALUES ($1, 'cw_decidir', $2) ON CONFLICT (nonce, purpose) DO NOTHING RETURNING nonce`,
+                [c.jti, Math.floor(Date.now() / 1000)]
+            );
+            if (!nuevo.rowCount) return noVale();
+            const vuelta = rutaSegura(c.v, VUELTA_DE_FABRICA[servicio]);
+            if (decision === 'cancel') {
+                await query(`DELETE FROM cuevaweb_conexiones WHERE id = $1 AND estado = 'pendiente'`, [p.id]);
+                return aLaTienda(res, t, clave, { s: servicio, n: c.n, v: vuelta, ok: false, error: 'Cancelaste: no se conectó ninguna cuenta.' });
+            }
+            // (13/11/2026, la revisión) el dueño confirmó: recién ahora la pendiente pierde la marca y /v1/confirmar la acepta
+            if (sinDecidir) {
+                const decidida = await query(
+                    `UPDATE cuevaweb_conexiones SET nonce = $2 WHERE id = $1 AND estado = 'pendiente' AND nonce = $3`,
+                    [p.id, c.n, MARCA_SIN_DECIDIR + c.n]
+                );
+                if (!decidida.rowCount) return noVale();
+            }
+            // `usuario`: la tienda revisa ANTES de confirmar si tiene guardado lo de otra cuenta (no se mezcla)
+            return aLaTienda(res, t, clave, { s: servicio, n: c.n, v: vuelta, ok: true, cuenta: p.nombre || p.usuario_id, usuario: p.usuario_id });
+        } catch (e) {
+            console.error(`[cuevaweb] decidir (${servicio}):`, e.message);
+            return res.status(500).set(ENCABEZADOS_CONFIRMAR).type('html').send(paginaCw('No pudimos terminar la conexión', 'Volvé al panel de tu tienda y tocá el botón otra vez. Si sigue pasando, escribinos a hola@cuevaweb.com.ar.'));
         }
     });
 

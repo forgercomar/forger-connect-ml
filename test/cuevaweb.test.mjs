@@ -12,11 +12,18 @@
  * Puertos: 3040 (la central), 3043 (Mercado Libre y Mercado Pago de mentira), 3044 (la tienda de mentira).
  *
  * Mide:
- *   C0  sin CUEVAWEB_MODO: /cuevaweb/* no existe (404), la portada es la de Forger y /webhooks contesta como siempre
+ *   C0  sin CUEVAWEB_MODO: /cuevaweb/* no existe (404, también /decidir), la portada es la de Forger y /webhooks contesta
+ *       como siempre
  *   C1  el panel registra una tienda (sin firma: 401; con firma: 200) y la clave queda CIFRADA en la base
  *   C2  la tienda con firma mala: 401; con la suya: su estado (nada conectado)
- *   C3  «Conectar con Mercado Libre»: el link firmado → la autorización de la app de CuevaWeb → la vuelta → la tienda,
- *       con su paquete firmado (ok y la cuenta); el mismo link otra vez: «ya se usó»
+ *   C3  «Conectar con Mercado Libre»: el link firmado → la autorización de la app de CuevaWeb → la vuelta, que (13/11/2026)
+ *       ya NO vuelve a la tienda: muestra «Confirmá tu cuenta de Mercado Libre» (200: la cuenta, el dominio y el nombre de
+ *       la tienda, los logos y la animación, los dos botones; que no se pueda meter en un iframe ni quede en un caché) con
+ *       la conexión pendiente; «Confirmar y conectar» → la tienda, con su paquete firmado (ok y la cuenta); el mismo link
+ *       otra vez: «ya se usó»
+ *   C3b (13/11/2026) el formulario de la pantalla: el mismo dos veces, adulterado (cada campo y la firma), vencido, del
+ *       futuro, sin la decisión o desde otro sitio → 400 «La confirmación venció o ya se usó» sin tocar nada; uno firmado
+ *       con la misma receta, sí pasa (el control)
  *   C4  confirmar con otro nonce: 409; con el del navegador: el token (sin el de renovación) y el app_id de CuevaWeb
  *   C5  el token: el mismo mientras vale; con ?forzar=1, uno nuevo (el de renovación ROTÓ en Mercado Libre)
  *   C6  un aviso de Mercado Libre a /webhooks → le llega a la tienda, firmado con SU clave → entregado
@@ -38,7 +45,16 @@
  *       que no es un pago → se ignora; un cuerpo de más de 64 KB → 413
  *   C17 las direcciones de prueba que no son de esta máquina se ignoran: el dueño va al Mercado Libre y al Mercado Pago
  *       de verdad
+ *   (13/11/2026, la confirmación)
+ *   C18 la MISMA cuenta otra vez: «Esta cuenta ya está conectada a esta tienda…»; una pantalla vieja (el dueño tocó el
+ *       botón otra vez) ya no decide nada; «Cancelar (usar otra cuenta)» borra la pendiente, la tienda recibe «Cancelaste:
+ *       no se conectó ninguna cuenta.», la conectada queda igual y el mismo «Cancelar» otra vez da 400
+ *   C19 OTRA cuenta de Mercado Libre: «Hoy esta tienda está conectada con …»; un apodo con <script>, un correo y el nombre
+ *       de la tienda con lo que hay que escapar, escapados
+ *   C20 Mercado Pago: otra cuenta («Los cobros nuevos van a caer en esta cuenta.») y de prueba («Es una cuenta de prueba:
+ *       no cobra de verdad.»)
  */
+import { LOGOS_CW } from '../cuevaweb-logos.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -89,7 +105,11 @@ function pgEnv() {
 }
 
 // ── Mercado Libre y Mercado Pago de mentira ─────────────────────────────────────────────────────────────────────────
-const F = { ml: { codigos: new Map(), access: null, refresh: null, renovaciones: 0, usuario: 777001 }, mp: { codigos: new Map(), access: null, refresh: null, renovaciones: 0, usuario: 555001 } };
+// (13/11/2026) el apodo, el correo y (Mercado Pago) si es de producción, a mano: la pantalla de confirmación los muestra
+const F = {
+    ml: { codigos: new Map(), access: null, refresh: null, renovaciones: 0, usuario: 777001, apodo: 'VENDEDOR_PRUEBA', correo: 'vendedor@ejemplo.com' },
+    mp: { codigos: new Map(), access: null, refresh: null, renovaciones: 0, usuario: 555001, apodo: 'COBRADOR_PRUEBA', correo: 'cobros@ejemplo.com', vivo: true },
+};
 function falso() {
     let n = 0;
     return http.createServer(async (req, res) => {
@@ -125,11 +145,11 @@ function falso() {
             k.refresh = `TG-${lado}-renovar-${++n}`;
             return json(200, lado === 'ml'
                 ? { access_token: k.access, refresh_token: k.refresh, expires_in: 21600, user_id: k.usuario }
-                : { access_token: k.access, refresh_token: k.refresh, expires_in: 15552000, user_id: k.usuario, public_key: `APP_USR-clave-publica-${n}`, live_mode: true });
+                : { access_token: k.access, refresh_token: k.refresh, expires_in: 15552000, user_id: k.usuario, public_key: `APP_USR-clave-publica-${n}`, live_mode: k.vivo });
         }
         if (req.method === 'GET' && ruta === '/users/me') {
             if (req.headers.authorization !== `Bearer ${k.access}`) return json(401, { message: 'invalid token' });
-            return json(200, lado === 'ml' ? { id: k.usuario, nickname: 'VENDEDOR_PRUEBA', site_id: 'MLA' } : { id: k.usuario, nickname: 'COBRADOR_PRUEBA', site_id: 'MLA' });
+            return json(200, { id: k.usuario, nickname: k.apodo, email: k.correo, site_id: 'MLA' });
         }
         json(404, { message: 'no existe' });
     });
@@ -173,23 +193,71 @@ function linkConectar(clave, servicio, n = azar(24)) {
     const d = Buffer.from(JSON.stringify({ s: servicio, v: servicio === 'ml' ? '/admin/mercadolibre/conexion' : '/admin/pagos', n, e: Date.now() + 10 * 60_000 })).toString('base64url');
     return { url: `${CENTRAL}/cuevaweb/conectar?t=${idDe(clave)}&d=${d}&f=${hmac(clave, `conectar.${d}`)}`, n };
 }
-/** El dueño toca el botón: el navegador sigue las redirecciones hasta volver a la tienda (sin entrar a ella). */
-async function irYVolver(url, clave) {
+/** (13/11/2026) conectar, la vuelta y la decisión comparten un límite: 40 pedidos cada 15 minutos por IP (y acá todo sale
+ *  de 127.0.0.1). Se anota cuánto queda, así una prueba nueva que lo pase falla diciéndolo (y no con un 429 raro). */
+let quedanConectar = null;
+function anotarLimite(u, r) {
+    const queda = r.headers.get('x-ratelimit-remaining');
+    if (new URL(u).origin === CENTRAL && new URL(u).pathname.startsWith('/cuevaweb/') && queda != null) quedanConectar = Number(queda);
+}
+/** Si la dirección es la vuelta a la tienda (/api/conectar/vuelta), lo que trae: su paquete y si lo firmó con su clave. */
+function vueltaDe(loc, base, clave) {
+    const v = new URL(loc, base);
+    if (v.pathname !== '/api/conectar/vuelta') return null;
+    const d = v.searchParams.get('d');
+    const f = v.searchParams.get('f');
+    const valido = f === hmac(clave, `conectar.vuelta.${d}`);
+    return { vuelta: v.pathname, valido, datos: JSON.parse(Buffer.from(d, 'base64url').toString('utf8')) };
+}
+const desescapar = (s) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+/** (13/11/2026) El formulario de la pantalla de confirmación: adónde va y sus campos ocultos (como los manda el navegador). */
+function leerFormulario(html, base) {
+    const accion = /<form method="POST" action="([^"]+)"/.exec(html);
+    if (!accion) return null;
+    const campos = {};
+    for (const m of html.matchAll(/<input type="hidden" name="([a-z]+)" value="([^"]*)"/g)) campos[m[1]] = desescapar(m[2]);
+    return { accion: new URL(desescapar(accion[1]), base).toString(), campos };
+}
+/** El dueño toca el botón de su tienda: el navegador sigue las redirecciones hasta la pantalla de confirmación de conectar
+ *  (status 200, el HTML, los encabezados y el formulario) o, si algo falla antes, hasta volver a la tienda (sin entrar). */
+async function irHasta(url, clave) {
     let u = url;
     for (let i = 0; i < 6; i++) {
         const r = await fetch(u, { redirect: 'manual' });
+        anotarLimite(u, r);
         const loc = r.headers.get('location');
-        if (!loc) return { status: r.status, texto: await r.text() };
-        if (new URL(loc, u).pathname === '/api/conectar/vuelta') {
-            const v = new URL(loc, u);
-            const d = v.searchParams.get('d');
-            const f = v.searchParams.get('f');
-            const valido = f === hmac(clave, `conectar.vuelta.${d}`);
-            return { vuelta: v.pathname, valido, datos: JSON.parse(Buffer.from(d, 'base64url').toString('utf8')) };
+        if (!loc) {
+            const html = await r.text();
+            return { status: r.status, html, encabezados: r.headers, form: leerFormulario(html, u) };
         }
+        const v = vueltaDe(loc, u, clave);
+        if (v) return v;
         u = new URL(loc, u).toString();
     }
     throw new Error('demasiadas redirecciones');
+}
+/** En la pantalla, el dueño toca «Confirmar y conectar» (confirm) o «Cancelar (usar otra cuenta)» (cancel): el navegador
+ *  manda el formulario (con `cambiar`, adulterado; sin `decision`, sin el botón) y vuelve a la tienda o muestra el error. */
+async function decidir(form, decision, clave, { cambiar = {}, encabezados = {} } = {}) {
+    const cuerpo = new URLSearchParams({ ...form.campos, ...cambiar });
+    if (decision) cuerpo.set('decision', decision);
+    const r = await fetch(form.accion, {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...encabezados }, body: cuerpo.toString(), redirect: 'manual',
+    });
+    anotarLimite(form.accion, r);
+    const loc = r.headers.get('location');
+    const v = loc ? vueltaDe(loc, form.accion, clave) : null;
+    if (v) return { status: r.status, ...v };
+    return { status: r.status, location: loc, html: await r.text() };
+}
+/** Todo junto: el botón de la tienda, la pantalla y uno de sus botones (si algo falla antes de la pantalla, la vuelta con
+ *  el error, como antes). */
+async function irYVolver(url, clave, decision = 'confirm') {
+    const ida = await irHasta(url, clave);
+    if (ida.vuelta) return ida;
+    assert.equal(ida.status, 200, ida.html);
+    assert.ok(ida.form, 'la pantalla trae el formulario');
+    return { ...(await decidir(ida.form, decision, clave)), pantalla: ida };
 }
 
 let central = null;
@@ -255,6 +323,7 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             await hastaQueConteste();
             assert.equal((await fetch(`${CENTRAL}/cuevaweb/v1/estado`)).status, 404);
             assert.equal((await fetch(`${CENTRAL}/cuevaweb/conectar`)).status, 404);
+            assert.equal((await fetch(`${CENTRAL}/cuevaweb/ml/decidir`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'decision=confirm' })).status, 404);
             assert.match(await (await fetch(`${CENTRAL}/`)).text(), /Forger/);
             const w = await fetch(`${CENTRAL}/webhooks`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: 'orders_v2', resource: '/orders/1', user_id: 1, application_id: 'APPML' }) });
             assert.equal(w.status, 200);
@@ -287,10 +356,49 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
         });
 
         let nMl = '';
-        await t.test('C3 «Conectar con Mercado Libre» va y vuelve', async () => {
+        let formMl = null;
+        await t.test('C3 «Conectar con Mercado Libre»: la pantalla de confirmación y «Confirmar y conectar»', async () => {
             const { url, n } = linkConectar(CLAVE_A, 'ml');
             nMl = n;
-            const v = await irYVolver(url, CLAVE_A);
+            // (13/11/2026) la vuelta del OAuth ya NO vuelve a la tienda: muestra qué cuenta entró
+            const ida = await irHasta(url, CLAVE_A);
+            assert.ok(!ida.vuelta, `volvió a la tienda sin preguntar: ${JSON.stringify(ida.datos)}`);
+            assert.equal(ida.status, 200, ida.html);
+            assert.ok(ida.form, 'la pantalla trae el formulario');
+            assert.equal(new URL(ida.form.accion).pathname, '/cuevaweb/ml/decidir');
+            assert.deepEqual(Object.keys(ida.form.campos).sort(), ['f', 'jti', 'n', 't', 'ts', 'u', 'v']);
+            const h = ida.html;
+            assert.match(h, /<title>Confirmá tu cuenta de Mercado Libre · CuevaWeb<\/title>/);
+            assert.match(h, /<h1>Confirmá tu cuenta de Mercado Libre<\/h1>/);
+            assert.match(h, /<button type="submit" name="decision" value="cancel" class="btn btn-secondary">Cancelar \(usar otra cuenta\)<\/button>/);
+            assert.match(h, /<button type="submit" name="decision" value="confirm" class="btn btn-primary">Confirmar y conectar<\/button>/);
+            assert.match(h, /<span class="v big">VENDEDOR_PRUEBA<\/span>/, 'el apodo, grande');
+            assert.ok(h.includes('vendedor@ejemplo.com'), 'el correo');
+            assert.ok(h.includes('Argentina (MLA)'), 'el país');
+            assert.ok(h.includes('<code>777001</code>'), 'el número de usuario');
+            assert.ok(h.includes('<span class="site-pill">127.0.0.1:3044</span>'), 'el dominio de la tienda');
+            assert.ok(h.includes('<span class="tienda">Tienda A</span>'), 'el nombre de la tienda');
+            // (13/11/2026, la revisión) los logos van adentro de conectar (cuevaweb-logos.js), no de direcciones de afuera
+            assert.ok(h.includes(`src="${LOGOS_CW.cuevaweb}"`) && h.includes(`src="${LOGOS_CW.ml}"`) && !h.includes('mlstatic') && !h.includes('cuevaweb.com.ar/img') && h.includes('<svg'), 'los logos (y la tienda, dibujada)');
+            assert.ok(h.includes('Publicaciones en Mercado Libre') && h.includes('Capa de integración'));
+            assert.ok(h.includes('@keyframes pulse') && h.includes('@keyframes flow') && h.includes('class="halo"'), 'la animación del trío');
+            assert.ok(h.includes('#8b5cf6') && !/#E55B0F/i.test(h) && !/forger/i.test(h), 'la marca de CuevaWeb, nada de Forger');
+            assert.ok(!h.includes('class="warnings"'), 'sin avisos: la tienda no tenía nada conectado');
+            assert.ok(!h.includes(F.ml.access) && !h.includes(F.ml.refresh), 'los tokens nunca en la pantalla');
+            // que no se pueda meter en un iframe (clickjacking) ni quede en un caché
+            assert.equal(ida.encabezados.get('x-frame-options'), 'DENY');
+            assert.match(ida.encabezados.get('content-security-policy') || '', /frame-ancestors 'none'/);
+            assert.match(ida.encabezados.get('cache-control') || '', /no-store/);
+            assert.equal(ida.encabezados.get('referrer-policy'), 'no-referrer');
+            // la conexión, pendiente: la tienda todavía no recibió nada
+            const filas = (await db.query(`SELECT estado, nonce FROM cuevaweb_conexiones WHERE servicio = 'ml'`)).rows;
+            assert.deepEqual(filas.map((r) => r.estado), ['pendiente']);
+            // (13/11/2026, la revisión) el nonce, MARCADO hasta que el dueño decida: /v1/confirmar no la encuentra todavía
+            assert.equal(filas[0].nonce, '?' + n);
+            // «Confirmar y conectar» → a la tienda, con su paquete firmado (ok, la cuenta y el usuario)
+            formMl = ida.form;
+            const v = await decidir(ida.form, 'confirm', CLAVE_A);
+            assert.equal(v.status, 303);
             assert.equal(v.vuelta, '/api/conectar/vuelta');
             assert.ok(v.valido, 'el paquete de vuelta firmado con la clave de la tienda');
             assert.equal(v.datos.ok, true, JSON.stringify(v.datos));
@@ -303,6 +411,49 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             const otraVez = await irYVolver(url, CLAVE_A);
             assert.equal(otraVez.datos.ok, false);
             assert.match(otraVez.datos.error, /ya se usó/);
+        });
+
+        await t.test('C3b el formulario: de un solo uso, firmado y con vencimiento (sin tocar nada)', async () => {
+            const noVale = (r, que) => {
+                assert.equal(r.status, 400, `${que}: ${r.status} ${JSON.stringify(r.datos || '')}`);
+                assert.match(r.html, /La confirmación venció o ya se usó/, que);
+                assert.match(r.html, /Volvé al panel de tu tienda y tocá el botón otra vez\./, que);
+            };
+            // el mismo formulario otra vez («Confirmar y conectar» ya se usó)
+            noVale(await decidir(formMl, 'confirm', CLAVE_A), 'repetido');
+            noVale(await decidir(formMl, 'cancel', CLAVE_A), 'repetido, con «Cancelar»');
+            // la receta de la firma (la prueba conoce WFML_OAUTH_HUB_SECRET): uno nuevo, bien firmado
+            const llave = crypto.createHmac('sha256', SECRETO_HUB).update('cuevaweb-decidir.v1').digest();
+            const firmar = (c) => hmac(llave, JSON.stringify(['cw-decidir', c.t, 'ml', c.n, c.v, c.u, c.ts, c.jti]));
+            const jtis = [];
+            const nuevo = (cambios = {}) => {
+                const c = { ...formMl.campos, jti: crypto.randomBytes(16).toString('hex'), ts: String(Math.floor(Date.now() / 1000)), ...cambios };
+                jtis.push(c.jti);
+                return { accion: formMl.accion, campos: { ...c, f: firmar(c) } };
+            };
+            // el control: uno firmado con la misma receta SÍ pasa (confirmar no cambia nada: la tienda es la que confirma)
+            const control = await decidir(nuevo(), 'confirm', CLAVE_A);
+            assert.equal(control.status, 303, control.html);
+            assert.equal(control.datos.ok, true);
+            const usado = jtis.pop();
+            // vencido (16 minutos) y del futuro (5 minutos), bien firmados
+            noVale(await decidir(nuevo({ ts: String(Math.floor(Date.now() / 1000) - 16 * 60) }), 'confirm', CLAVE_A), 'vencido');
+            noVale(await decidir(nuevo({ ts: String(Math.floor(Date.now() / 1000) + 5 * 60) }), 'confirm', CLAVE_A), 'del futuro');
+            // adulterado después de firmar: cada campo, y la firma
+            for (const [k, v] of [['n', azar(24)], ['v', '/admin/pagos'], ['t', '999'], ['u', '999999'], ['ts', String(Math.floor(Date.now() / 1000) - 1)], ['jti', crypto.randomBytes(16).toString('hex')]]) {
+                noVale(await decidir(nuevo(), 'confirm', CLAVE_A, { cambiar: { [k]: v } }), `adulterado: ${k}`);
+            }
+            const f = nuevo();
+            noVale(await decidir(f, 'confirm', CLAVE_A, { cambiar: { f: f.campos.f.slice(0, -2) + (f.campos.f.endsWith('AA') ? 'BB' : 'AA') } }), 'la firma cambiada');
+            // sin la decisión (ningún botón) y desde otro sitio
+            noVale(await decidir(nuevo(), '', CLAVE_A), 'sin la decisión');
+            noVale(await decidir(nuevo(), 'confirm', CLAVE_A, { encabezados: { 'sec-fetch-site': 'cross-site' } }), 'desde otro sitio');
+            // nada se tocó: la pendiente sigue (con su nonce) y ninguno de los rechazados se gastó
+            const p = (await db.query(`SELECT estado, nonce FROM cuevaweb_conexiones WHERE servicio = 'ml'`)).rows;
+            assert.deepEqual(p.map((r) => [r.estado, r.nonce]), [['pendiente', nMl]]);
+            const gastados = (await db.query(`SELECT nonce FROM request_nonces WHERE purpose = 'cw_decidir' AND nonce = ANY($1::text[])`, [jtis])).rows;
+            assert.deepEqual(gastados, [], 'los rechazados no gastan su jti');
+            assert.equal((await db.query(`SELECT COUNT(*)::int AS n FROM request_nonces WHERE purpose = 'cw_decidir' AND nonce = ANY($1::text[])`, [[usado, formMl.campos.jti]])).rows[0].n, 2, 'los que pasaron, sí');
         });
 
         let tokenMl = '';
@@ -353,6 +504,70 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             assert.notEqual(esteFallo.datos.access_token, ahora);
             assert.equal(esteFallo.datos.access_token, F.ml.access);
             tokenMl = esteFallo.datos.access_token;
+        });
+
+        // (13/11/2026, la confirmación) Después de C5 y C13: un OAuth nuevo le cambia los tokens al Mercado Libre de mentira
+        // (guarda uno solo) y la conexión de la tienda ya no se renovaría; de acá en adelante, Mercado Libre no se renueva.
+        await t.test('C18 la misma cuenta otra vez: el aviso y «Cancelar (usar otra cuenta)»', async () => {
+            const activa = async () => (await db.query(`SELECT id, usuario_id, access_enc, refresh_enc, confirmada FROM cuevaweb_conexiones WHERE servicio = 'ml' AND estado = 'activa'`)).rows;
+            const antes = await activa();
+            assert.equal(antes.length, 1);
+            // una pantalla que el dueño deja abierta… y vuelve a tocar el botón: otra vuelta, otra pendiente
+            const vieja = await irHasta(linkConectar(CLAVE_A, 'ml').url, CLAVE_A);
+            assert.equal(vieja.status, 200, vieja.html);
+            const { url, n } = linkConectar(CLAVE_A, 'ml');
+            const ida = await irHasta(url, CLAVE_A);
+            assert.equal(ida.status, 200, ida.html);
+            // la pantalla vieja ya no decide nada (su pendiente la reemplazó la nueva): 400 y la nueva sigue ahí
+            const deLaVieja = await decidir(vieja.form, 'confirm', CLAVE_A);
+            assert.equal(deLaVieja.status, 400, JSON.stringify(deLaVieja.datos || ''));
+            assert.ok(ida.html.includes('<strong>⚠ Atención antes de confirmar:</strong>'));
+            assert.ok(ida.html.includes('<li>Esta cuenta ya está conectada a esta tienda: confirmar sólo renueva el permiso (no duplica nada).</li>'));
+            assert.ok(!ida.html.includes('Hoy esta tienda está conectada con'));
+            assert.equal((await db.query(`SELECT COUNT(*)::int AS n FROM cuevaweb_conexiones WHERE servicio = 'ml' AND estado = 'pendiente' AND nonce = $1`, ['?' + n])).rows[0].n, 1);
+            // «Cancelar (usar otra cuenta)» → la pendiente se borra y la tienda se entera
+            const v = await decidir(ida.form, 'cancel', CLAVE_A);
+            assert.equal(v.status, 303);
+            assert.ok(v.valido, 'firmado con la clave de la tienda');
+            assert.deepEqual({ ok: v.datos.ok, error: v.datos.error, n: v.datos.n, v: v.datos.v }, { ok: false, error: 'Cancelaste: no se conectó ninguna cuenta.', n, v: '/admin/mercadolibre/conexion' });
+            assert.equal(v.datos.cuenta, undefined);
+            assert.equal((await db.query(`SELECT COUNT(*)::int AS n FROM cuevaweb_conexiones WHERE servicio = 'ml' AND estado = 'pendiente'`)).rows[0].n, 0, 'la pendiente, borrada');
+            assert.deepEqual(await activa(), antes, 'la conectada, igual que antes');
+            // el mismo «Cancelar» otra vez: 400; y la tienda ya no la puede confirmar
+            const otra = await decidir(ida.form, 'cancel', CLAVE_A);
+            assert.equal(otra.status, 400);
+            assert.match(otra.html, /La confirmación venció o ya se usó/);
+            assert.equal((await pedir('POST', '/cuevaweb/v1/confirmar', { clave: CLAVE_A, tienda: CLAVE_A, cuerpo: { servicio: 'ml', n } })).status, 409);
+            assert.deepEqual(await activa(), antes);
+        });
+
+        await t.test('C19 otra cuenta de Mercado Libre: el aviso, y lo de afuera escapado (un apodo con <script>)', async () => {
+            // el nombre de la tienda con lo que hay que escapar (el panel la vuelve a registrar igual, con otro nombre)
+            const nombreRaro = `Tienda <A> & "Cía" 'x'`;
+            assert.equal((await pedir('PUT', '/cuevaweb/panel/tiendas/tiendaA', { clave: CLAVE_PANEL, cuerpo: { url: TIENDA, clave: CLAVE_A, nombre: nombreRaro } })).status, 200);
+            const guardado = { usuario: F.ml.usuario, apodo: F.ml.apodo, correo: F.ml.correo };
+            Object.assign(F.ml, { usuario: 777002, apodo: '<script>alert("apodo")</script>', correo: 'otra"><img src=x onerror=alert(1)>@ejemplo.com' });
+            try {
+                const ida = await irHasta(linkConectar(CLAVE_A, 'ml').url, CLAVE_A);
+                assert.equal(ida.status, 200, ida.html);
+                const h = ida.html;
+                assert.ok(!h.includes('<script'), 'ningún <script> en la página');
+                assert.ok(!h.includes('<img src=x'), 'el correo no entra como HTML');
+                assert.ok(h.includes('<span class="v big">&lt;script&gt;alert(&quot;apodo&quot;)&lt;/script&gt;</span>'), 'el apodo, escapado');
+                assert.ok(h.includes('otra&quot;&gt;&lt;img src=x onerror=alert(1)&gt;@ejemplo.com'), 'el correo, escapado');
+                assert.ok(h.includes('<span class="tienda">Tienda &lt;A&gt; &amp; &quot;Cía&quot; &#39;x&#39;</span>'), 'el nombre de la tienda, escapado');
+                assert.ok(h.includes('<span class="site-pill">127.0.0.1:3044</span>'), 'el dominio de la tienda');
+                assert.ok(h.includes('<code>777002</code>'));
+                assert.ok(h.includes('<li>Hoy esta tienda está conectada con <strong>VENDEDOR_PRUEBA</strong>. Si confirmás, se cambia por esta, salvo que la tienda ya haya traído publicaciones o ventas de esa cuenta: en ese caso no se cambia nada y primero hay que desconectarla.</li>'), 'el aviso de la otra cuenta');
+                assert.ok(!h.includes('Los cobros nuevos'), 'eso es de Mercado Pago');
+                assert.ok(!h.includes('Esta cuenta ya está conectada a esta tienda'));
+                const v = await decidir(ida.form, 'cancel', CLAVE_A);
+                assert.equal(v.datos.ok, false);
+            } finally {
+                Object.assign(F.ml, guardado);
+            }
+            assert.deepEqual((await db.query(`SELECT usuario_id, estado FROM cuevaweb_conexiones WHERE servicio = 'ml'`)).rows, [{ usuario_id: '777001', estado: 'activa' }], 'sigue la de antes');
+            assert.equal((await pedir('PUT', '/cuevaweb/panel/tiendas/tiendaA', { clave: CLAVE_PANEL, cuerpo: { url: TIENDA, clave: CLAVE_A, nombre: 'Tienda A' } })).status, 200);
         });
 
         await t.test('C6 un aviso de Mercado Libre llega a la tienda, firmado', async () => {
@@ -452,7 +667,19 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
         await t.test('C8 «Conectar con Mercado Pago» y su aviso de pago', async () => {
             const { url, n } = linkConectar(CLAVE_A, 'mp');
             const v = await irYVolver(url, CLAVE_A);
+            // (13/11/2026) antes de volver, la pantalla: la cuenta de Mercado Pago, de producción y sin avisos
+            const h = v.pantalla.html;
+            assert.match(h, /<h1>Confirmá tu cuenta de Mercado Pago<\/h1>/);
+            assert.match(h, /<span class="v big">COBRADOR_PRUEBA<\/span>/);
+            assert.ok(h.includes('cobros@ejemplo.com') && h.includes('<code>555001</code>'));
+            assert.ok(h.includes('Cobros con Mercado Pago') && h.includes(`src="${LOGOS_CW.mp}"`));
+            assert.ok(h.includes('<span class="pill-mode pill-live">Producción · cobros reales</span>'));
+            assert.ok(!h.includes('class="warnings"'), 'sin avisos');
+            assert.ok(h.includes('cerrá la sesión en mercadopago.com.ar'));
+            assert.equal(new URL(v.pantalla.form.accion).pathname, '/cuevaweb/mp/decidir');
             assert.equal(v.datos.ok, true, JSON.stringify(v.datos));
+            assert.equal(v.datos.cuenta, 'COBRADOR_PRUEBA');
+            assert.equal(v.datos.usuario, '555001');
             assert.equal(v.datos.v, '/admin/pagos');
             assert.equal(F.mp.ultimaAutorizacion.platform_id, 'mp');
             const r = await pedir('POST', '/cuevaweb/v1/confirmar', { clave: CLAVE_A, tienda: CLAVE_A, cuerpo: { servicio: 'mp', n } });
@@ -509,6 +736,33 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             assert.ok(new Date(vence).getTime() > Date.now() + 100 * 86_400_000);
         });
 
+        // (13/11/2026, la confirmación) Después de C9 y C10 (las renovaciones de Mercado Pago), por lo mismo que C18.
+        await t.test('C20 Mercado Pago: otra cuenta y de prueba (los dos avisos), y se cancela', async () => {
+            const guardado = { usuario: F.mp.usuario, apodo: F.mp.apodo, correo: F.mp.correo, vivo: F.mp.vivo };
+            Object.assign(F.mp, { usuario: 555002, apodo: 'OTRO_COBRADOR', correo: 'otro@ejemplo.com', vivo: false });
+            try {
+                const ida = await irHasta(linkConectar(CLAVE_A, 'mp').url, CLAVE_A);
+                assert.equal(ida.status, 200, ida.html);
+                const h = ida.html;
+                assert.match(h, /<h1>Confirmá tu cuenta de Mercado Pago<\/h1>/);
+                assert.match(h, /<span class="v big">OTRO_COBRADOR<\/span>/);
+                assert.ok(h.includes('otro@ejemplo.com') && h.includes('<code>555002</code>'));
+                assert.ok(h.includes('<span class="pill-mode pill-test">Prueba · sin cobros reales</span>'), 'el modo: prueba');
+                assert.ok(h.includes('<li>Hoy esta tienda está conectada con <strong>COBRADOR_PRUEBA</strong>. Si confirmás, se cambia por esta. Los cobros nuevos van a caer en esta cuenta.</li>'), 'el aviso de la otra cuenta');
+                assert.ok(h.includes('<li>Es una cuenta de prueba: no cobra de verdad.</li>'), 'el aviso de prueba');
+                assert.ok(!h.includes('Esta cuenta ya está conectada a esta tienda'));
+                assert.equal(new URL(ida.form.accion).pathname, '/cuevaweb/mp/decidir');
+                const v = await decidir(ida.form, 'cancel', CLAVE_A);
+                assert.equal(v.status, 303);
+                assert.equal(v.datos.ok, false);
+                assert.equal(v.datos.error, 'Cancelaste: no se conectó ninguna cuenta.');
+                assert.equal(v.datos.v, '/admin/pagos');
+            } finally {
+                Object.assign(F.mp, guardado);
+            }
+            assert.deepEqual((await db.query(`SELECT usuario_id, estado, produccion FROM cuevaweb_conexiones WHERE servicio = 'mp'`)).rows, [{ usuario_id: '555001', estado: 'activa', produccion: true }], 'sigue la de antes');
+        });
+
         await t.test('C11 otra tienda no se lleva la misma cuenta de Mercado Libre', async () => {
             const r = await pedir('PUT', '/cuevaweb/panel/tiendas/tiendaB', { clave: CLAVE_PANEL, cuerpo: { url: 'http://127.0.0.1:3049', clave: CLAVE_B, nombre: 'Tienda B' } });
             assert.equal(r.status, 200);
@@ -518,6 +772,8 @@ test('el modo CuevaWeb de punta a punta', { skip: URL_DB ? false : 'sin DATABASE
             const v = await irYVolver(url, CLAVE_B);
             assert.equal(v.datos.ok, false);
             assert.match(v.datos.error, /ya está conectada a otra tienda/);
+            // (13/11/2026) la última vuelta de esta central: las pruebas no se comieron el límite de conectar
+            assert.ok(quedanConectar >= 3, `quedan ${quedanConectar} de 40 pedidos a conectar/volver/decidir: repartí las pruebas nuevas (el límite es por IP y cada 15 minutos)`);
         });
 
         await t.test('C12 desconectar y dar de baja', async () => {
