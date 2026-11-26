@@ -26,6 +26,11 @@
  * órdenes actualizadas en los últimos WFML_ORDER_SWEEP_GRACE_SEC no se tocan
  * todavía (su aviso puede estar en camino): quedan para la pasada siguiente.
  *
+ * La PRIMERA pasada de una cuenta (sin cursor) no busca nada: deja el cursor en
+ * ahora y el barrido arranca desde ese momento (decisión del dueño, 26-11: las ventas
+ * cuyo aviso se perdió ANTES de instalar el barrido no se traen). Desde ahí, una
+ * caída se recupera desde el cursor, con el tope de WFML_ORDER_SWEEP_MAX_HOURS.
+ *
  * Nunca se barre antes del alta de la cuenta en el conector (accounts.created_at):
  * una venta anterior no puede haberse perdido acá, y encolarla la haría entrar al
  * sistema como venta en vivo (con reserva de stock).
@@ -40,7 +45,7 @@
  *   WFML_ORDER_SWEEP_INTERVAL     ms entre pasadas (default 300000 = 5 min; mínimo 15000)
  *   WFML_ORDER_SWEEP_OVERLAP_MIN  minutos de solapamiento con la pasada anterior (default 10)
  *   WFML_ORDER_SWEEP_GRACE_SEC    segundos que se le dan al aviso antes de barrer una orden (default 120)
- *   WFML_ORDER_SWEEP_MAX_HOURS    tope hacia atrás, la primera vez o después de una caída larga (default 72)
+ *   WFML_ORDER_SWEEP_MAX_HOURS    tope hacia atrás después de una caída larga (default 72)
  *   WFML_ORDER_SWEEP_WINDOW_MIN   tamaño de cada ventana de una recuperación larga (default 360)
  *   WFML_ORDER_SWEEP_PAUSE_MS     pausa entre páginas de ML (default 250)
  *
@@ -257,6 +262,11 @@ export async function sweepAccount(account, nowMs = Date.now()) {
 
     const prev = await query(`SELECT cursor_at FROM order_sweeps WHERE account_id = $1`, [account.id]);
     const cursorMs = prev.rowCount ? new Date(prev.rows[0].cursor_at).getTime() : null;
+    if (cursorMs === null) {
+        await saveRow(account.id, { cursorMs: horizonMs, runAt: nowMs, okAt: nowMs, error: null, ...stats });
+        console.log(`[sweep] cuenta ${account.public_id}: primera pasada; el barrido arranca desde ${new Date(horizonMs).toISOString()}`);
+        return stats;
+    }
     let start = cursorMs !== null ? cursorMs - SWEEP.overlapMin * 60000 : capMs;
     if (start < capMs) {
         if (cursorMs !== null) {

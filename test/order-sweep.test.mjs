@@ -12,7 +12,7 @@
  * Cubre:
  *   S1 fechas: comienzo de la hora, formato de ML y ventanas contiguas.
  *   S2 la clasificación de cada orden (reciente, en cola, nueva, cambio, al día).
- *   S3 primera pasada: encola la que falta y la que cambió (source='sweep'), no la
+ *   S3 primera pasada: no busca nada y deja el cursor en ahora. S3b, desde un cursor: encola la que falta y la que cambió (source='sweep'), no la
  *      que ya está, ni la que se actualizó hace segundos (su aviso puede venir).
  *   S4 idempotente: otra pasada no vuelve a encolar nada, ni con la orden en la
  *      cola ni ya procesada.
@@ -187,10 +187,21 @@ check('sin snapshot, procesada después del cambio: al día', classifyOrder(o(NO
 check('sin snapshot, procesada antes del cambio: cambio', classifyOrder(o(NOW - HORA), { pending: false, lastProcessedMs: NOW - 2 * HORA }, undefined, H) === 'cambio');
 check('snapshot del historial sin date_last_updated: compara last_updated', classifyOrder(o(NOW - HORA), undefined, { last_updated: iso(NOW - HORA), status: 'paid' }, H) === 'al_dia');
 
-// S3 — primera pasada -------------------------------------------------------
+// S3 — primera pasada: no busca nada, el barrido arranca desde ahora ------------
 console.log('\n== S3 primera pasada ==');
 reset(); _resetBackoff();
+const P = cuenta(6);
+ordenML(P, 91, NOW - 50 * HORA);                                                    // perdida antes del barrido
+const s3p = await sweepAccount(P, NOW);
+check('la primera vez no le pide nada a ML', world.searches.length === 0, String(world.searches.length));
+check('la primera vez no encola nada', deSweep(P).length === 0 && s3p.enqueued === 0, JSON.stringify(deSweep(P)));
+check('la primera vez deja el cursor en ahora − la espera', world.sweeps.get(6) && new Date(world.sweeps.get(6).cursor_at).getTime() === NOW - 120000, world.sweeps.get(6) && world.sweeps.get(6).cursor_at);
+
+// S3b — una pasada desde un cursor de hace 72 h ---------------------------------
+console.log('\n== S3b pasada desde el cursor ==');
+reset(); _resetBackoff();
 const A = cuenta(7);
+world.sweeps.set(7, { cursor_at: new Date(NOW - 72 * HORA + 10 * 60000).toISOString(), total_recovered_new: 0, total_recovered_changes: 0 });
 const ya = ordenML(A, 101, NOW - 40 * 60000); evento(A, 101, NOW - 39 * 60000); snapshot(A, 101, ya);
 ordenML(A, 102, NOW - 35 * 60000);                                                  // el aviso nunca llegó
 const vieja = ordenML(A, 103, NOW - 30 * 60000, { status: 'cancelled' });
@@ -204,7 +215,7 @@ check('cuenta 2 nuevas y 1 cambio', s3.recoveredNew === 2 && s3.recoveredChanges
 const f3 = world.sweeps.get(7);
 check('el cursor queda en ahora − la espera', f3 && new Date(f3.cursor_at).getTime() === NOW - 120000, f3 && f3.cursor_at);
 check('la fila guarda lo recuperado y la pasada buena', f3.total_recovered_new === 2 && f3.total_recovered_changes === 1 && f3.last_error === null && !!f3.last_ok_at, JSON.stringify(f3));
-check('la primera vez barre las últimas 72 h', world.searches.length > 0 && Date.parse(world.searches[0].updatedFrom) === floorH(NOW - 72 * HORA), world.searches[0] && world.searches[0].updatedFrom);
+check('barre desde el cursor − 10 min (72 h)', world.searches.length > 0 && Date.parse(world.searches[0].updatedFrom) === floorH(NOW - 72 * HORA), world.searches[0] && world.searches[0].updatedFrom);
 
 // S4 — idempotente ----------------------------------------------------------
 console.log('\n== S4 otra pasada no duplica ==');
@@ -230,6 +241,7 @@ reset(); _resetBackoff();
 const B = cuenta(8, { created_at: new Date(NOW - 2 * HORA).toISOString() });
 ordenML(B, 201, NOW - 5 * HORA);          // de antes de conectar la cuenta
 ordenML(B, 202, NOW - HORA);
+world.sweeps.set(8, { cursor_at: new Date(NOW - 5 * HORA).toISOString(), total_recovered_new: 0, total_recovered_changes: 0 });
 await sweepAccount(B, NOW);
 check('no pide a ML antes del alta', Date.parse(world.searches[0].updatedFrom) === floorH(NOW - 2 * HORA), world.searches[0].updatedFrom);
 check('sólo encola la posterior al alta', JSON.stringify(deSweep(B)) === JSON.stringify(['202']), JSON.stringify(deSweep(B)));
