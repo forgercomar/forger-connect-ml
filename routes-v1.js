@@ -20,6 +20,7 @@
  *   GET  /v1/orders/pending     → órdenes sin aplicar (payload v2: orden completa
  *                                 + billing + shipment desde order_snapshots). Auth: cuenta.
  *   POST /v1/orders/ack         → marca órdenes como aplicadas. Auth: cuenta.
+ *   GET  /v1/orders/status      → estado de la cola de órdenes y del barrido (salud). Auth: cuenta.
  *   POST /v1/orders/backfill    → job de importación histórica (Ventas ML). Auth: cuenta.
  *   GET  /v1/orders/history     → pagina los snapshots completos. Auth: cuenta.
  *   GET  /v1/orders/labels      → etiquetas de Mercado Envíos en lote (pdf|zpl). Auth: cuenta.
@@ -43,6 +44,7 @@ import {
 } from './auth.js';
 import { verifyCapabilityToken } from './license-token.js';
 import { accountLicenseVerdict } from './license-context.js';
+import { SWEEP } from './order-sweep.js';
 import { getValidAccessToken, refreshAccessToken, mlGetShipmentLabel, mlGetShipmentLabels, mlGetPackMessages, mlSendPackMessage, mlGetActionGuide, mlSendActionGuideOption, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
 
 // Header donde el satélite ML manda el capability-token de licencia (Fase 6).
@@ -1077,6 +1079,68 @@ export function mountV1(app, opts = {}) {
             [req.account.id, ids]
         );
         return res.json({ ok: true, marked: r.rowCount });
+    });
+
+    // -------------------------------------------------------------------------
+    // GET /v1/orders/status  (v2.11.0)
+    // Estado de la cola de órdenes de la cuenta, para el punto de salud de la
+    // sincronización y los avisos del sistema: cuántas esperan y desde hace cuánto
+    // (sin bajar de ML / bajadas y sin drenar), el último barrido (order-sweep.js)
+    // y si ML pide reconectar la cuenta. Sin datos de las órdenes.
+    //
+    // Respuesta:
+    //   { ok, queue: { unprocessed, unprocessed_age_sec, undelivered, undelivered_age_sec,
+    //                  oldest_waiting_sec },
+    //     sweep: { enabled, interval_sec, cursor_at, last_run_at, last_ok_at, last_error,
+    //              last_enqueued, last_recovered_new, last_recovered_changes,
+    //              total_recovered_new, total_recovered_changes },
+    //     reauth_required }
+    // -------------------------------------------------------------------------
+    app.get(p('/v1/orders/status'), authAccount, async (req, res) => {
+        const q = await query(
+            `SELECT COUNT(*) FILTER (WHERE processed_at IS NULL)::int AS unprocessed,
+                    COUNT(*) FILTER (WHERE processed_at IS NOT NULL)::int AS undelivered,
+                    COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(received_at) FILTER (WHERE processed_at IS NULL)), 0)::int AS unprocessed_age,
+                    COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(received_at) FILTER (WHERE processed_at IS NOT NULL)), 0)::int AS undelivered_age
+             FROM order_events
+             WHERE account_id = $1 AND delivered_at IS NULL`,
+            [req.account.id]
+        );
+        const c = q.rows[0] || {};
+        const sw = await query(
+            `SELECT cursor_at, last_run_at, last_ok_at, last_error, last_enqueued,
+                    last_recovered_new, last_recovered_changes, total_recovered_new, total_recovered_changes
+             FROM order_sweeps WHERE account_id = $1`,
+            [req.account.id]
+        );
+        const s = sw.rows[0] || null;
+        const ra = await query(`SELECT reauth_required_at FROM accounts WHERE id = $1`, [req.account.id]);
+        const uAge = Number(c.unprocessed_age) || 0, dAge = Number(c.undelivered_age) || 0;
+        return res.json({
+            ok: true,
+            queue: {
+                unprocessed: Number(c.unprocessed) || 0,
+                unprocessed_age_sec: uAge,
+                undelivered: Number(c.undelivered) || 0,
+                undelivered_age_sec: dAge,
+                oldest_waiting_sec: Math.max(uAge, dAge),
+            },
+            sweep: {
+                enabled: SWEEP.enabled,
+                interval_sec: Math.round(SWEEP.intervalMs / 1000),
+                cursor_at: s ? s.cursor_at : null,
+                last_run_at: s ? s.last_run_at : null,
+                last_ok_at: s ? s.last_ok_at : null,
+                // Sólo el código (rate_limited, ml_http_500…): el detalle queda en el registro del conector.
+                last_error: s && s.last_error ? String(s.last_error).split(':')[0] : null,
+                last_enqueued: s ? Number(s.last_enqueued) : 0,
+                last_recovered_new: s ? Number(s.last_recovered_new) : 0,
+                last_recovered_changes: s ? Number(s.last_recovered_changes) : 0,
+                total_recovered_new: s ? Number(s.total_recovered_new) : 0,
+                total_recovered_changes: s ? Number(s.total_recovered_changes) : 0,
+            },
+            reauth_required: !!(ra.rows[0] && ra.rows[0].reauth_required_at),
+        });
     });
 
     // -------------------------------------------------------------------------
