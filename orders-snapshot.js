@@ -33,7 +33,7 @@ export async function enrichOrder(account, token, order, opts = {}) {
     const mlOrderId = order && order.id != null ? String(order.id) : '';
     if (mlOrderId && opts.billing !== false) {
         try {
-            out.billing = await mlGetOrderBillingInfo(account, token, mlOrderId);
+            out.billing = await mlGetOrderBillingInfo(account, token, mlOrderId, order);
         } catch (err) {
             console.warn(`[orders] billing_info ${mlOrderId} no disponible:`, err.message);
         }

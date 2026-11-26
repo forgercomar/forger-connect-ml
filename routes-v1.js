@@ -43,7 +43,7 @@ import {
 } from './auth.js';
 import { verifyCapabilityToken } from './license-token.js';
 import { accountLicenseVerdict } from './license-context.js';
-import { getValidAccessToken, refreshAccessToken, mlGetShipmentLabel, mlGetShipmentLabels, mlGetPackMessages, mlSendPackMessage, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
+import { getValidAccessToken, refreshAccessToken, mlGetShipmentLabel, mlGetShipmentLabels, mlGetPackMessages, mlSendPackMessage, mlGetActionGuide, mlSendActionGuideOption, mlSearchQuestions, mlAnswerQuestion } from './ml-api.js';
 
 // Header donde el satélite ML manda el capability-token de licencia (Fase 6).
 // (El central TN usa X-Wftn-License-Token con este MISMO archivo copiado.)
@@ -1418,6 +1418,74 @@ export function mountV1(app, opts = {}) {
             return res.json({ ok: true, message: r.data || null });
         } catch (err) {
             console.error('[v1/messages/reply] error:', err.message);
+            if (/sin refresh_token utilizable/.test(err.message)) {
+                return res.status(409).json({ ok: false, error: 'no_refresh_token', message: 'La cuenta de Mercado Libre necesita reconectarse: el servidor no tiene un refresh_token válido guardado.' });
+            }
+            return res.status(502).json({ ok: false, error: 'reply_failed', message: 'No se pudo enviar el mensaje a Mercado Libre.' });
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // POST /v1/messages/start
+    // Body: { pack_id, buyer_user_id, text, option_id? = 'OTHER' }
+    // El VENDEDOR escribe primero (p. ej. el link de pago de la percepción de IIBB). Según la
+    // documentación vigente de ML (motivos-para-comunicarse, mensajes-bloqueados):
+    //   1. GET de la guía de acciones del pack;
+    //      · 400 «blocked_by_excepted_case» → caso exceptuado: se envía por la mensajería común;
+    //   2. la opción pedida (OTHER, texto libre, 350 caracteres) con cupo (cap_available ≥ 1) →
+    //      POST de la opción;
+    //      · 403 «conversation blocked, please check blocked messages» (el comprador ya inició la
+    //        conversación) → se envía por la mensajería común;
+    //   3. sin la opción o sin cupo → 409 (hay que esperar a que el comprador responda).
+    // Respuesta: { ok, via: 'motivo' | 'mensajeria', message } con el mensaje crudo de ML (trae
+    // status y message_moderation: el sistema registra si ML lo moderó).
+    // -------------------------------------------------------------------------
+    app.post(p('/v1/messages/start'), authAccount, async (req, res) => {
+        const packId   = String((req.body && req.body.pack_id) || '').trim();
+        const buyerId  = String((req.body && req.body.buyer_user_id) || '').trim();
+        const text     = String((req.body && req.body.text) || '').trim();
+        const optionId = String((req.body && req.body.option_id) || 'OTHER').trim().toUpperCase();
+        if (!/^\d+$/.test(packId) || !/^\d+$/.test(buyerId) || !text || !/^[A-Z_]{2,40}$/.test(optionId)) {
+            return res.status(400).json({ ok: false, error: 'bad_request', message: 'Faltan pack_id, buyer_user_id o text.' });
+        }
+        const motivoML = (r) => (r && r.data && (r.data.message || r.data.error)) || `HTTP ${r && r.status}`;
+        const porMensajeria = async (token) => {
+            const r = await mlSendPackMessage(req.account, token, packId, buyerId, text);
+            if (!r.ok) return res.status(502).json({ ok: false, error: 'ml_rejected', ml_status: r.status, message: `Mercado Libre rechazó el mensaje: ${motivoML(r)}` });
+            return res.json({ ok: true, via: 'mensajeria', message: r.data || null });
+        };
+        try {
+            const token = await getValidAccessToken(req.account);
+            const guia = await mlGetActionGuide(req.account, token, packId);
+            const causa = String((guia.data && (guia.data.cause || guia.data.error)) || '');
+            if (!guia.ok && /blocked_by_excepted_case/.test(causa + ' ' + String(guia.data && guia.data.message || ''))) {
+                return await porMensajeria(token);
+            }
+            if (!guia.ok) {
+                return res.status(502).json({ ok: false, error: 'ml_rejected', ml_status: guia.status, message: `Mercado Libre no entregó los motivos para comunicarse: ${motivoML(guia)}` });
+            }
+            const opciones = Array.isArray(guia.data && guia.data.options) ? guia.data.options : [];
+            const op = opciones.find((o) => String(o && (o.id || o.option_id) || '').toUpperCase() === optionId);
+            if (!op || op.enabled === false || op.actionable === false) {
+                return res.status(409).json({ ok: false, error: 'option_unavailable', message: `Mercado Libre no ofrece el motivo ${optionId} para esta venta.` });
+            }
+            const cupo = Number(op.cap_available);
+            if (Number.isFinite(cupo) && cupo < 1) {
+                return res.status(409).json({ ok: false, error: 'no_cap', message: 'Mercado Libre no permite enviar otro mensaje con ese motivo hasta que el comprador responda.' });
+            }
+            const lim = Number(op.char_limit);
+            if (Number.isFinite(lim) && lim > 0 && text.length > lim) {
+                return res.status(400).json({ ok: false, error: 'too_long', message: `El mensaje supera los ${lim} caracteres que permite Mercado Libre.` });
+            }
+            const r = await mlSendActionGuideOption(req.account, token, packId, optionId, text);
+            if (r.ok) return res.json({ ok: true, via: 'motivo', message: r.data || null });
+            if (r.status === 403 && /check blocked messages|use_message_api/i.test(motivoML(r))) {
+                return await porMensajeria(token);
+            }
+            const err = r.status === 403 && /not allowed to execute the option/i.test(motivoML(r)) ? 'no_cap' : 'ml_rejected';
+            return res.status(err === 'no_cap' ? 409 : 502).json({ ok: false, error: err, ml_status: r.status, message: `Mercado Libre rechazó el mensaje: ${motivoML(r)}` });
+        } catch (err) {
+            console.error('[v1/messages/start] error:', err.message);
             if (/sin refresh_token utilizable/.test(err.message)) {
                 return res.status(409).json({ ok: false, error: 'no_refresh_token', message: 'La cuenta de Mercado Libre necesita reconectarse: el servidor no tiene un refresh_token válido guardado.' });
             }

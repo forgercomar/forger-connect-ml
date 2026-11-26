@@ -303,7 +303,24 @@ export async function mlGetOrder(account, accessToken, orderId) {
  *
  * @returns {Promise<object>} el JSON crudo de billing_info
  */
-export async function mlGetOrderBillingInfo(account, accessToken, orderId) {
+export async function mlGetOrderBillingInfo(account, accessToken, orderId, order = null) {
+    // Recurso NUEVO (developers.mercadolibre.com.ar/es_ar/facturacion): la orden trae
+    // buyer.billing_info.id y los datos salen de /orders/billing-info/{site}/{id}?order.id=
+    // con la MISMA forma que x-version 2 (más iibb_number). El recurso viejo quedó deprecado
+    // «con funcionamiento paralelo por tiempo limitado» (puede contestar 404): se usa sólo
+    // si la orden no trae el id o el nuevo falla.
+    const biId = order && order.buyer && order.buyer.billing_info && order.buyer.billing_info.id != null
+        ? String(order.buyer.billing_info.id) : '';
+    if (/^[A-Za-z0-9_-]+$/.test(biId)) {
+        const site = String((order && order.site_id) || account.site_id || 'MLA').toUpperCase();
+        const nuevo = await mlGet(
+            account,
+            `/orders/billing-info/${encodeURIComponent(site)}/${encodeURIComponent(biId)}?order.id=${encodeURIComponent(orderId)}`,
+            accessToken
+        );
+        if (nuevo.ok && nuevo.data) return nuevo.data;
+        console.warn(`[orders] billing-info nuevo ${orderId} HTTP ${nuevo.status}: se intenta el recurso viejo`);
+    }
     const r = await mlGet(
         account,
         `/orders/${encodeURIComponent(orderId)}/billing_info`,
@@ -645,6 +662,30 @@ export async function mlSendPackMessage(account, accessToken, packId, buyerUserI
     return mlPost(account, path, accessToken, {
         from: { user_id: uid },
         to:   { user_id: Number(buyerUserId) },
+        text: String(text || ''),
+    });
+}
+
+/**
+ * MOTIVOS PARA COMUNICARSE (action guide) de un pack: lo que el VENDEDOR puede usar para
+ * INICIAR la conversación post-venta (developers.mercadolibre.com.ar/es_ar/motivos-para-comunicarse).
+ *   GET /messages/action_guide/packs/{pack_id}?tag=post_sale
+ * Devuelve { ok, status, data } sin tirar: un 400 con cause «blocked_by_excepted_case» es un caso
+ * exceptuado (la mensajería se usa sin motivo) y lo decide quien llama.
+ */
+export async function mlGetActionGuide(account, accessToken, packId) {
+    return mlGet(account, `/messages/action_guide/packs/${encodeURIComponent(String(packId))}?tag=post_sale`, accessToken);
+}
+
+/**
+ * Envía un motivo de texto libre (OTHER) de la guía de acciones.
+ *   POST /messages/action_guide/packs/{pack_id}/option?tag=post_sale  { option_id, text }
+ * Consume el cupo (cap_available) de esa opción; después de que el comprador responda, los
+ * mensajes siguientes van por POST /messages/packs/... (mlSendPackMessage).
+ */
+export async function mlSendActionGuideOption(account, accessToken, packId, optionId, text) {
+    return mlPost(account, `/messages/action_guide/packs/${encodeURIComponent(String(packId))}/option?tag=post_sale`, accessToken, {
+        option_id: String(optionId || 'OTHER'),
         text: String(text || ''),
     });
 }
