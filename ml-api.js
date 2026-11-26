@@ -365,9 +365,11 @@ export async function mlGetShipment(account, accessToken, shipmentId) {
  * payments, buyer, totales); billing_info y shipment siguen siendo llamadas
  * aparte por orden.
  *
- * @param {object} range { from?, to?, offset?, limit?, sort? } — fechas en el
- *   formato ISO de ML (ej. '2025-07-03T00:00:00.000-00:00').
- * @returns {Promise<{ results: object[], total: number }>}
+ * @param {object} range { from?, to?, updatedFrom?, updatedTo?, offset?, limit?, sort? } —
+ *   fechas en el formato ISO de ML (ej. '2025-07-03T00:00:00.000-00:00'). from/to
+ *   filtran por creación; updatedFrom/updatedTo, por última actualización.
+ * @returns {Promise<{ results: object[], total: number }>} — si ML contesta error,
+ *   tira un Error con .status (HTTP) para que el llamador distinga un 429.
  */
 export async function mlSearchOrders(account, accessToken, range = {}) {
     const uid    = Number(account.ml_user_id);
@@ -377,9 +379,16 @@ export async function mlSearchOrders(account, accessToken, range = {}) {
     let path = `/orders/search?seller=${uid}&offset=${offset}&limit=${limit}&sort=${encodeURIComponent(sort)}`;
     if (range.from) path += `&order.date_created.from=${encodeURIComponent(range.from)}`;
     if (range.to)   path += `&order.date_created.to=${encodeURIComponent(range.to)}`;
+    // Por fecha de ÚLTIMA ACTUALIZACIÓN (barrido de órdenes, order-sweep.js): filtros
+    // order.date_last_updated.from / .to de developers.mercadolibre.com.ar/es_ar/gestiona-ventas
+    // («Filtrar órdenes»). ML usa la fecha hasta la HORA y descarta minutos y segundos.
+    if (range.updatedFrom) path += `&order.date_last_updated.from=${encodeURIComponent(range.updatedFrom)}`;
+    if (range.updatedTo)   path += `&order.date_last_updated.to=${encodeURIComponent(range.updatedTo)}`;
     const r = await mlGet(account, path, accessToken);
     if (!r.ok || !r.data) {
-        throw new Error(`orders/search falló: HTTP ${r.status} ${(r.data && r.data.message) || ''}`);
+        const err = new Error(`orders/search falló: HTTP ${r.status} ${(r.data && r.data.message) || ''}`);
+        err.status = r.status;
+        throw err;
     }
     return {
         results: Array.isArray(r.data.results) ? r.data.results : [],
