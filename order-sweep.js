@@ -222,7 +222,7 @@ async function saveRow(accountId, fields) {
         `INSERT INTO order_sweeps (account_id, cursor_at, last_run_at, last_ok_at, last_error,
                                    last_seen, last_enqueued, last_recovered_new, last_recovered_changes,
                                    total_recovered_new, total_recovered_changes, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $8, $9, NOW())
+         VALUES ($1, $2::timestamptz, $3::timestamptz, $4::timestamptz, $5, $6::int, $7::int, $8::int, $9::int, $8::int, $9::int, NOW())
          ON CONFLICT (account_id) DO UPDATE SET
              cursor_at   = GREATEST(order_sweeps.cursor_at, EXCLUDED.cursor_at),
              last_run_at = COALESCE(EXCLUDED.last_run_at, order_sweeps.last_run_at),
