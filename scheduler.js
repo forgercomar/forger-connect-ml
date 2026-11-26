@@ -51,6 +51,7 @@ import { query } from './db.js';
 import { generatePublicId } from './auth.js';
 import { getValidAccessToken, mlGetOrder, mlSearchOrders, mlGetMessage, mlGetQuestion } from './ml-api.js';
 import { enrichOrder, upsertOrderSnapshot } from './orders-snapshot.js';
+import { startOrderSweep } from './order-sweep.js';
 
 const AUTOSYNC_ENABLED = process.env.WFML_AUTOSYNC_ENABLED !== '0';
 const INTERVAL_HOURS   = Math.max(1, Number(process.env.WFML_AUTOSYNC_INTERVAL_HOURS) || 6);
@@ -845,6 +846,9 @@ export function startScheduler() {
     } else {
         console.log('[scheduler] mensajería/preguntas deshabilitado (WFML_MSG_ENABLED=0)');
     }
+
+    // Loop 8 — barrido periódico de órdenes: la red de los avisos perdidos (order-sweep.js, v2.11.0).
+    startOrderSweep();
 
     // Loop 6 — janitor de jobs zombie.
     if (ZOMBIE_ENABLED) {
