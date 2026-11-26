@@ -523,7 +523,8 @@ export function mountV1(app, opts = {}) {
                          shared_secret = $5,
                          refresh_token_enc = COALESCE(NULLIF($6, ''), refresh_token_enc),
                          refresh_token_iv  = COALESCE(NULLIF($7, ''), refresh_token_iv),
-                         last_token_refresh_at = CASE WHEN $6 <> '' THEN NOW() ELSE last_token_refresh_at END
+                         last_token_refresh_at = CASE WHEN $6 <> '' THEN NOW() ELSE last_token_refresh_at END,
+                         reauth_required_at = CASE WHEN $6 <> '' THEN NULL ELSE reauth_required_at END
                      WHERE id = $1`,
                     [accId, nick, siteId, siteUrl, storedSecret, enc.ciphertext, enc.iv]
                 );
@@ -991,7 +992,11 @@ export function mountV1(app, opts = {}) {
             synced_at: row.synced_at,
         }));
         const total = jobs.reduce((s, j) => s + j.count, 0);
-        return res.json({ ok: true, pending: jobs.length > 0, jobs, total });
+        // ¿ML dejó de autorizar la cuenta? (db/012). El sistema lo consulta acá en cada drenado
+        // y muestra el aviso de reconectar.
+        const ra = await query(`SELECT reauth_required_at FROM accounts WHERE id = $1`, [req.account.id]);
+        const reauth = !!(ra.rows[0] && ra.rows[0].reauth_required_at);
+        return res.json({ ok: true, pending: jobs.length > 0, jobs, total, reauth_required: reauth });
     });
 
     // -------------------------------------------------------------------------

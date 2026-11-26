@@ -87,6 +87,20 @@ export async function refreshAccessToken(account) {
     try { data = JSON.parse(raw); } catch (_) { data = null; }
     if (!resp.ok || !data || !data.access_token) {
         const msg = (data && (data.message || data.error_description)) || `HTTP ${resp.status}`;
+        // invalid_grant: ML ya no acepta este refresh_token (permiso quitado o token muerto). Se
+        // marca la cuenta para reconectar SÓLO si la base sigue con el MISMO refresh_token que se
+        // usó: si otro proceso lo rotó en paralelo (dos renovaciones a la vez), no es una baja (db/012).
+        if (data && data.error === 'invalid_grant') {
+            try {
+                await query(
+                    `UPDATE accounts SET reauth_required_at = COALESCE(reauth_required_at, NOW())
+                     WHERE id = $1 AND refresh_token_enc = $2`,
+                    [account.id, account.refresh_token_enc]
+                );
+            } catch (e) {
+                console.warn('[ml-api] no se pudo marcar la cuenta para reconectar:', e.message);
+            }
+        }
         throw new Error(`ML rechazó el refresh: ${msg}`);
     }
 
@@ -105,7 +119,8 @@ export async function refreshAccessToken(account) {
             access_expires_at = $4,
             refresh_token_enc = $5,
             refresh_token_iv  = $6,
-            last_token_refresh_at = NOW()
+            last_token_refresh_at = NOW(),
+            reauth_required_at = NULL
          WHERE id = $1`,
         [account.id, accEnc.ciphertext, accEnc.iv, expiresAt.toISOString(),
          refEnc.ciphertext, refEnc.iv]
