@@ -157,6 +157,9 @@ const HUB_SECRET       = process.env.WFML_OAUTH_HUB_SECRET || '';
 const ML_AUTH_DOMAIN   = process.env.ML_AUTH_DOMAIN || 'https://auth.mercadolibre.com.ar';
 const BASE_URL         = (process.env.BASE_URL || 'https://goforger.com').replace(/\/$/, '');
 const CALLBACK_URL     = `${BASE_URL}/connect-ml/callback`;
+// El logo de Forger de la pantalla de confirmación (copia de Proyecto Color, 24-11-2026; ver
+// VERSIONES.md). Sin la variable, el de siempre.
+const MARCA_URL        = process.env.WFML_MARCA_URL || 'https://goforger.com/forger-logo.png';
 
 // ============================================================================
 // Config Mercado Pago (OAuth de Checkout Pro). MP y ML son el MISMO proveedor
@@ -615,7 +618,7 @@ function confirmationPage({ payload, returnTo, nonce, siteUrl, alreadyConnected 
             </div>
             <div class="center">
                 <div class="halo" aria-hidden="true"></div>
-                <div class="ring is-center"><img src="https://goforger.com/forger-logo.png" alt="Forger" onerror="this.style.display='none'" /></div>
+                <div class="ring is-center"><img src="${escapeHtml(MARCA_URL)}" alt="Forger" onerror="this.style.display='none'" /></div>
                 <span class="label is-center"><strong>Forger</strong><br><span>Capa de integración</span></span>
             </div>
             <div class="connector" aria-hidden="true">
