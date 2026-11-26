@@ -1020,7 +1020,10 @@ export function mountV1(app, opts = {}) {
             `SELECT DISTINCT ON (e.ml_order_id)
                     e.ml_order_id, e.order_status, e.items_json,
                     s.order_json, s.billing_json, s.shipment_json,
-                    s.updated_at AS snapshot_at
+                    s.updated_at AS snapshot_at,
+                    (SELECT array_agg(x.id) FROM order_events x
+                      WHERE x.account_id = e.account_id AND x.ml_order_id = e.ml_order_id
+                        AND x.processed_at IS NOT NULL AND x.delivered_at IS NULL AND x.error IS NULL) AS ev_ids
              FROM order_events e
              LEFT JOIN order_snapshots s
                     ON s.account_id = e.account_id AND s.ml_order_id = e.ml_order_id
@@ -1032,6 +1035,12 @@ export function mountV1(app, opts = {}) {
              LIMIT 200`,
             [req.account.id]
         );
+        // Marca los avisos que el plugin está viendo: el ack confirma SÓLO esos (db/011). Uno de la
+        // misma orden que llegue o se procese después queda pendiente y sale en el próximo drenado.
+        const servidos = r.rows.flatMap((row) => (Array.isArray(row.ev_ids) ? row.ev_ids : []));
+        if (servidos.length) {
+            await query(`UPDATE order_events SET served_at = NOW() WHERE id = ANY($1::bigint[])`, [servidos]);
+        }
         const orders = r.rows.map((row) => ({
             ml_order_id: row.ml_order_id,
             status:      row.order_status,
@@ -1047,8 +1056,9 @@ export function mountV1(app, opts = {}) {
     // -------------------------------------------------------------------------
     // POST /v1/orders/ack
     // Body: { ml_order_ids: ["123", ...] }
-    // El plugin confirma que aplicó esas órdenes a su ledger. Marcamos todas
-    // las order_events de esas órdenes como delivered.
+    // El plugin confirma que aplicó esas órdenes a su ledger. Marcamos como
+    // delivered las order_events de esas órdenes que le entregó /v1/orders/pending
+    // (served_at): las que llegaron después siguen pendientes.
     // -------------------------------------------------------------------------
     app.post(p('/v1/orders/ack'), authAccount, async (req, res) => {
         const ids = Array.isArray(req.body && req.body.ml_order_ids)
@@ -1057,7 +1067,8 @@ export function mountV1(app, opts = {}) {
         if (!ids.length) return res.json({ ok: true, marked: 0 });
         const r = await query(
             `UPDATE order_events SET delivered_at = NOW()
-             WHERE account_id = $1 AND ml_order_id = ANY($2::text[]) AND delivered_at IS NULL`,
+             WHERE account_id = $1 AND ml_order_id = ANY($2::text[]) AND delivered_at IS NULL
+               AND served_at IS NOT NULL`,
             [req.account.id, ids]
         );
         return res.json({ ok: true, marked: r.rowCount });
