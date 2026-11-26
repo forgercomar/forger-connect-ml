@@ -63,7 +63,9 @@ const WEBHOOK_ENABLED        = process.env.WFML_WEBHOOK_ENABLED !== '0';
 const WEBHOOK_BATCH_INTERVAL = Math.max(15000, Number(process.env.WFML_WEBHOOK_BATCH_INTERVAL) || 60000);
 
 const ORDER_ENABLED  = process.env.WFML_ORDER_ENABLED !== '0';
-const ORDER_INTERVAL = Math.max(15000, Number(process.env.WFML_ORDER_INTERVAL) || 60000);
+// 20 s (antes 60 s): la venta de ML llega a Ventas en ~1,5 min en el peor caso, con el drenaje
+// del sistema cada 60 s. Son lecturas de Postgres; a ML sólo se le pide lo que entró por aviso.
+const ORDER_INTERVAL = Math.max(15000, Number(process.env.WFML_ORDER_INTERVAL) || 20000);
 // Mensajería + Preguntas (M0, v2.9.0): mismo modelo que las órdenes.
 const MSG_ENABLED    = process.env.WFML_MSG_ENABLED !== '0';
 const MSG_INTERVAL   = Math.max(15000, Number(process.env.WFML_MSG_INTERVAL) || 60000);
