@@ -1250,6 +1250,14 @@ app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, async (req, res)
     // sospechoso al inspeccionar; el `action` lo mandamos en el body (mismo
     // dispatch en WordPress, sin duplicación visible).
     const returnUrl = new URL(returnTo);
+    // Lo que el sistema puso en la query del return_to (en la nube, ws=<espacio>) viaja como campo
+    // del formulario: sin la galleta de la sesión (navegador que no la manda en un POST entre sitios)
+    // el sistema resuelve el espacio por ese ws=; sin él, la vuelta caía en el espacio por defecto y
+    // terminaba en «oauth_bad_nonce» (ensayo-ml, escenario 9).
+    const camposDelReturnTo = [...returnUrl.searchParams.entries()]
+        .filter(([k]) => !['action', 'nonce', 'payload', 'signature'].includes(k))
+        .map(([k, v]) => `<input type="hidden" name="${escAttr(k)}" value="${escAttr(v)}">`)
+        .join('\n    ');
     returnUrl.search = '';
     const formAction = escAttr(returnUrl.toString());
     res.type('html').send(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
@@ -1274,6 +1282,7 @@ app.post(['/connect-ml/finish', '/finish'], limitFinishRefresh, async (req, res)
     <input type="hidden" name="nonce" value="${escAttr(nonce)}">
     <input type="hidden" name="payload" value="${escAttr(payloadB64)}">
     <input type="hidden" name="signature" value="${escAttr(signature)}">
+    ${camposDelReturnTo}
     <noscript>
       <p style="margin-top:14px;font-size:13px;color:#6b7280;">JavaScript está desactivado.</p>
       <button type="submit" class="fallback-btn">Continuar manualmente</button>
